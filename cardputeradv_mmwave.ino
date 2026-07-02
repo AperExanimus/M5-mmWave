@@ -13,6 +13,11 @@ int numBaudRates = sizeof(baudRates) / sizeof(baudRates[0]);
 int currentBaudIdx = 0;
 int CURRENT_BAUD = baudRates[currentBaudIdx];
 
+// ROTATION MODES
+int rotationModes[] = {0, 1, 2, 3};
+const char* rotationNames[] = {"0° (Normal)", "90° (CW)", "180°", "270° (CW)"};
+int currentRotationIdx = 1;  // Start at 90° since that's what was hardcoded
+
 HardwareSerial ld2410(1);
 
 String statusMessage = "Ready";
@@ -37,14 +42,7 @@ void setup() {
   auto cfg = M5.config();
   M5Cardputer.begin(cfg, true);
   
-  M5Cardputer.Display.setRotation(1);
-  
-  uint16_t w = M5Cardputer.Display.width();
-  uint16_t h = M5Cardputer.Display.height();
-  canvas.createSprite(w - 4, h - 4);
-  canvas.setRotation(1);
-  canvas.setTextColor(WHITE);
-  canvas.setTextSize(1);
+  setDisplayRotation(currentRotationIdx);
   
   Serial.printf("[UART] Initializing at %d baud\n", CURRENT_BAUD);
   ld2410.begin(CURRENT_BAUD, SERIAL_8N1, SENSOR_RX_PIN, SENSOR_TX_PIN);
@@ -53,22 +51,44 @@ void setup() {
   Serial.println("[INIT] Complete");
 }
 
+void setDisplayRotation(int idx) {
+  currentRotationIdx = max(0, min(idx, 3));
+  
+  // Set display rotation
+  M5Cardputer.Display.setRotation(rotationModes[currentRotationIdx]);
+  
+  // Delete old canvas and create new one with correct dimensions
+  canvas.deleteSprite();
+  
+  uint16_t w = M5Cardputer.Display.width();
+  uint16_t h = M5Cardputer.Display.height();
+  canvas.createSprite(w - 4, h - 4);
+  
+  // Don't rotate the canvas itself - just draw at correct orientation
+  canvas.setTextColor(WHITE);
+  canvas.setTextSize(1);
+  
+  Serial.printf("[ROTATION] Changed to %s (Mode %d, Display size: %dx%d)\n", 
+                rotationNames[currentRotationIdx], rotationModes[currentRotationIdx], w, h);
+  statusMessage = rotationNames[currentRotationIdx];
+}
+
 void drawInterface() {
   canvas.fillSprite(BLACK);
   
   // Title
   canvas.setCursor(5, 8);
   canvas.println("LD2410C - Flexible Baud Mode");
-  canvas.drawFastHLine(0, 22, 280, WHITE);
+  canvas.drawFastHLine(0, 22, canvas.width() - 10, WHITE);
   
   // Controls info
   canvas.setCursor(5, 30);
   canvas.setTextSize(0.8);
-  canvas.printf("W/Q: Change | Space: Reset | Esc: Restart");
+  canvas.printf("W/Q: Baud | A/Z: Rotate");
   canvas.setTextSize(1);
   
   // Baud rate box
-  canvas.fillRect(5, 45, 270, 45, DARKGREY);
+  canvas.fillRect(5, 45, canvas.width() - 10, 45, DARKGREY);
   canvas.setTextColor(YELLOW);
   canvas.setTextSize(1);
   canvas.setCursor(15, 55);
@@ -79,8 +99,15 @@ void drawInterface() {
   canvas.setCursor(15, 75);
   canvas.printf("%d Hz", CURRENT_BAUD);
   
+  // Rotation mode box
+  canvas.fillRect(5, 100, canvas.width() - 10, 30, DARKGREY);
+  canvas.setTextColor(MAGENTA);
+  canvas.setTextSize(1);
+  canvas.setCursor(15, 110);
+  canvas.printf("Rotation: %s", rotationNames[currentRotationIdx]);
+  
   // Activity indicator (color-coded by activity level)
-  canvas.setCursor(5, 105);
+  canvas.setCursor(5, 140);
   if (anyDataReceived && millis() - dataTimestamp < 1000) {
     canvas.setTextColor(BLUE);
     canvas.printf("ACTIVE (%d bytes/sec)", byteCount);
@@ -92,14 +119,14 @@ void drawInterface() {
     canvas.printf("NO DATA DETECTED");
   }
   
-  // Byte pattern hint (shows first few bytes for quick reference)
-  canvas.setCursor(5, 125);
+  // Byte pattern hint
+  canvas.setCursor(5, 160);
   canvas.setTextColor(WHITE);
   canvas.setTextSize(0.7);
-  canvas.printf("Tip: Look for non-zero variety in Serial Monitor");
+  canvas.printf("Tip: Look for non-zero variety in Serial");
   
   // Status line
-  canvas.setCursor(5, 145);
+  canvas.setCursor(5, 180);
   canvas.setTextSize(1);
   canvas.printf("Status: %s", statusMessage.c_str());
   
@@ -156,7 +183,15 @@ void loop() {
             if (currentBaudIdx < 0) currentBaudIdx = numBaudRates - 1;
             changeBaudRate();
             statusMessage = "↓ Decreased baud";
-          } 
+          }
+          // A = Rotate counter-clockwise
+          else if (k == 'a' || k == 'A') {
+            setDisplayRotation(currentRotationIdx - 1);
+          }
+          // Z = Rotate clockwise
+          else if (k == 'z' || k == 'Z') {
+            setDisplayRotation(currentRotationIdx + 1);
+          }
           // Space = Reset all counters
           else if (k == ' ') {
             byteCount = 0;
