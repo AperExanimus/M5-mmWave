@@ -56,33 +56,30 @@ void drawInterface() {
   canvas.fillSprite(BLACK);
   
   // Title
-  canvas.setCursor(5, 8);
-  canvas.println("LD2410C - Flexible Baud Mode");
-  canvas.drawFastHLine(0, 22, canvas.width() - 10, WHITE);
+  canvas.setCursor(5, 5);
+  canvas.setTextSize(1);
+  canvas.setTextColor(WHITE);
+  canvas.println("LD2410C Interactive Scanner");
+  canvas.drawFastHLine(0, 18, canvas.width() - 10, WHITE);
   
   // Controls info
-  canvas.setCursor(5, 30);
-  canvas.setTextSize(0.8);
-  canvas.printf("W/Q: Change | Space: Reset | Esc: Restart");
+  canvas.setCursor(5, 24);
   canvas.setTextSize(1);
+  canvas.setTextColor(WHITE);
+  canvas.printf("W/Q: Baud | Space: Reset | Esc: Restart");
   
-  // Baud rate box
-  canvas.fillRect(5, 45, canvas.width() - 10, 45, DARKGREY);
+  // Current baud - readable display
+  canvas.setTextSize(1);
   canvas.setTextColor(YELLOW);
-  canvas.setTextSize(1);
-  canvas.setCursor(15, 55);
-  canvas.printf("Index: %d/%d", currentBaudIdx, numBaudRates - 1);
-  
-  canvas.setTextColor(CYAN);
-  canvas.setTextSize(2);
-  canvas.setCursor(15, 75);
-  canvas.printf("%d Hz", CURRENT_BAUD);
+  canvas.setCursor(5, 38);
+  canvas.printf("Baud: %d Hz", CURRENT_BAUD);
   
   // Activity indicator (color-coded by activity level)
-  canvas.setCursor(5, 105);
+  canvas.setTextSize(1);
+  canvas.setCursor(5, 52);
   if (anyDataReceived && millis() - dataTimestamp < 1000) {
     canvas.setTextColor(BLUE);
-    canvas.printf("ACTIVE (%d bytes/sec)", byteCount);
+    canvas.printf("ACTIVE (%d b/s)", byteCount);
   } else if (anyDataReceived && millis() - dataTimestamp < 2000) {
     canvas.setTextColor(GREEN);
     canvas.printf("Some data...");
@@ -91,15 +88,10 @@ void drawInterface() {
     canvas.printf("NO DATA DETECTED");
   }
   
-  // Byte pattern hint (shows first few bytes for quick reference)
-  canvas.setCursor(5, 125);
-  canvas.setTextColor(WHITE);
-  canvas.setTextSize(0.7);
-  canvas.printf("Tip: Look for non-zero variety in Serial Monitor");
-  
   // Status line
-  canvas.setCursor(5, 145);
   canvas.setTextSize(1);
+  canvas.setTextColor(WHITE);
+  canvas.setCursor(5, 66);
   canvas.printf("Status: %s", statusMessage.c_str());
   
   canvas.pushSprite(2, 2);
