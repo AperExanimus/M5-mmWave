@@ -176,8 +176,9 @@ void loop() {
   if (!connected) {
     if (doScan) {
       Serial.println("[BLE CLIENT] Scanning for target...");
-      BLEScanResults foundDevices = BLEDevice::getScan()->start(3); // 3s scan
-      Serial.printf("[BLE CLIENT] Scan complete, %d devices found\n", foundDevices.getCount());
+      BLEDevice::getScan()->start(3);
+      //commented out due to undeclared foundDevices. 
+   //   Serial.printf("[BLE CLIENT] Scan complete, %d devices found\n", foundDevices.getCount());
       // If device was found via callbacks, doConnect will be set
     }
 
@@ -190,7 +191,7 @@ void loop() {
         // cleanup
         if (pClient) {
           pClient->disconnect();
-          BLEDevice::deleteClient(pClient);
+          delete pClient;
           pClient = nullptr;
         }
         connected = false;
@@ -217,7 +218,7 @@ void loop() {
       // cleanup and re-scan
       if (pClient) {
         pClient->disconnect();
-        BLEDevice::deleteClient(pClient);
+        delete pClient;
         pClient = nullptr;
       }
       doScan = true;
