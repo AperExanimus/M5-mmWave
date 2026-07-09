@@ -6,7 +6,9 @@
 // CONFIGURATION
 // ============================================================
 #define SENSOR_RX_PIN 13
+//yellow cable
 #define SENSOR_TX_PIN 15
+//white cable
 
 // ============================================================
 // GLOBALS
