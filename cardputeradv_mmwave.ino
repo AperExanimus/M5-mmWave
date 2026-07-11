@@ -6,6 +6,9 @@
 // ============================================================
 #define SENSOR_RX_PIN 15   // CardPuter GPIO15 ← Sensor TX
 #define SENSOR_TX_PIN 13   // CardPuter GPIO13 ← Sensor RX
+// Engineering mode detection + control
+bool engineeringDetected = false;          // set true when we see long payloads / many nonzero bytes
+const uint16_t ENGINEERING_LEN_THRESH = 120; // if a frame's payloadLen > this, assume engineering mode
 
 // Serial/log baud (for Serial Monitor)
 const unsigned long LOG_BAUD = 115200;
@@ -162,6 +165,21 @@ void processFrame(uint8_t *buf, uint16_t len) {
   }
 
   validFrames++;
+
+    // --- auto-detect engineering mode by payload length / content ---
+  if (!engineeringDetected) {
+    // If payload length is large, or contains many non-zero bytes, it's almost certainly engineering-mode gate data
+    int nonzero = 0;
+    for (uint16_t i = 0; i < len; ++i) if (buf[i] != 0) nonzero++;
+    if (len >= ENGINEERING_LEN_THRESH || nonzero > (len/4)) {
+      engineeringDetected = true;
+      metricMode = PAYLOAD_SUM; // switch to absolute-energy metric automatically
+      Serial.printf("[AUTO] Engineering-mode detected (len=%u nonzero=%d). Switching to PAYLOAD_SUM\n", (unsigned)len, nonzero);
+      // reset any sliding windows/buffers so we don't use old inapplicable values
+      metricsIdx = 0; metricsCount = 0; metricsSum = 0;
+    }
+  }
+
   addMetric(metric);
   unsigned long avg = metricsAverage();
 
@@ -303,6 +321,58 @@ void sendEnableEngineeringMode() {
   Serial.println("Sent enable-engineering-mode candidate frame to sensor (please verify ACK).");
 }
 
+// send enable engineering mode and wait up to `timeoutMs` for an ACK
+void sendEnableEngineeringModeOnce(unsigned long timeoutMs = 800) {
+  // Send command: header + len(0x0002) + cmdWord(0x0062 LSB-first) + footer
+  uint8_t cmd[] = { 0xFD,0xFC,0xFB,0xFA, 0x02,0x00, 0x62,0x00, 0x04,0x03,0x02,0x01 };
+  ld2410.write(cmd, sizeof(cmd));
+  Serial.println("Sent enable-engineering-mode candidate frame; waiting for ACK...");
+
+  // simple blocking scan for the ACK pattern in incoming bytes
+  const uint8_t ACK_PREFIX[] = {0xFD,0xFC,0xFB,0xFA, 0x04,0x00, 0x62,0x01};
+  int match = 0;
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    if (ld2410.available()) {
+      uint8_t b = ld2410.read();
+      // optionally print bytes while waiting (comment out if too noisy)
+      // Serial.printf("%02X ", b);
+      if (b == ACK_PREFIX[match]) {
+        match++;
+        if (match == (int)(sizeof(ACK_PREFIX))) {
+          // we saw header+len+ack-cmd; next two bytes should be status
+          // read status bytes if available
+          unsigned long t0 = millis();
+          while (ld2410.available() < 2 && millis() - t0 < 200) delay(5);
+          if (ld2410.available() >= 2) {
+            uint8_t s0 = ld2410.read();
+            uint8_t s1 = ld2410.read();
+            uint16_t status = (uint16_t)s0 | ((uint16_t)s1 << 8);
+            if (status == 0) {
+              Serial.println("ACK: engineering mode enabled (status=0).");
+              engineeringDetected = true;
+              metricMode = PAYLOAD_SUM;
+              metricsIdx = 0; metricsCount = 0; metricsSum = 0;
+              return;
+            } else {
+              Serial.printf("ACK received but status=%u (failure)\n", (unsigned)status);
+              return;
+            }
+          } else {
+            Serial.println("ACK prefix matched but status bytes not received in time.");
+            return;
+          }
+        }
+      } else {
+        match = (b == ACK_PREFIX[0]) ? 1 : 0;
+      }
+    } else {
+      delay(5);
+    }
+  }
+  Serial.println("No ACK received for enable-engineering command (timeout).");
+}
+
 // ---------------- Setup & UI ----------------
 void setup() {
   Serial.begin(LOG_BAUD);
@@ -429,6 +499,10 @@ void loop() {
           } else if (k == '\x1B') {
             esp_restart();
           }
+          else if (k == 'e' || k == 'E') {
+           sendEnableEngineeringModeOnce();
+           statusMessage = "Send enable cmd (see Serial)";
+}
           lastKeyTime = millis();
         }
       }
