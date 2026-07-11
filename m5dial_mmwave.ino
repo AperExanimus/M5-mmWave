@@ -5,9 +5,9 @@
 // ============================================================
 // CONFIGURATION
 // ============================================================
-#define SENSOR_RX_PIN 13
+#define SENSOR_RX_PIN 15
 //yellow cable
-#define SENSOR_TX_PIN 15
+#define SENSOR_TX_PIN 13
 //white cable
 
 // ============================================================
@@ -24,12 +24,13 @@ unsigned long lastPresenceTime = 0;
 const unsigned long PRESENCE_DEBOUNCE_MS = 1000;  // Debounce presence changes
 
 void setup() {
-  Serial.begin(115200);
+  sensor = new LD2410Sensor(Serial1, SENSOR_RX_PIN, SENSOR_TX_PIN, 115200);  // Changed!
+  sensor->begin();
   Serial.println("\n=== M5DIAL + LD2410C + BLE ===");
 
   auto cfg = M5.config();
   M5Dial.begin(cfg, true);
-
+  
   M5Dial.Display.setRotation(0);
   uint16_t w = M5Dial.Display.width();
   uint16_t h = M5Dial.Display.height();
@@ -40,6 +41,15 @@ void setup() {
   // Initialize sensor
   sensor = new LD2410Sensor(Serial1, SENSOR_RX_PIN, SENSOR_TX_PIN, 256000);
   sensor->begin();
+
+  // DEBUG: Check if we're getting any data at all
+  delay(1000);
+  int availableBytes = 0;
+  while (Serial1.available()) {
+    availableBytes++;
+    Serial1.read();
+  }
+  Serial.printf("[DEBUG] Available bytes after init: %d\n", availableBytes);
 
   // Initialize Bluetooth
   bleManager = new BluetoothManager("M5-mmWave");
@@ -143,13 +153,27 @@ void drawInterface() {
 void loop() {
   M5Dial.update();
 
+  // DEBUG: Print raw bytes coming from sensor
+  static unsigned long lastRawPrint = 0;
+  if (millis() - lastRawPrint > 2000) {
+    if (Serial1.available()) {
+      Serial.print("[RAW] ");
+      int count = 0;
+      while (Serial1.available() && count++ < 50) {
+        Serial.printf("%02X ", Serial1.read());
+      }
+      Serial.println();
+    } else {
+      Serial.println("[RAW] No data available");
+    }
+    lastRawPrint = millis();
+  }
+
   if (sensor) {
     sensor->update();
   }
 
   updatePresenceDetection();
-
   drawInterface();
-
   delay(10);
 }
