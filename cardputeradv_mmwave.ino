@@ -1,49 +1,87 @@
+/*
+  cardputeradv_mmwave.ino
+  Final hybrid parser build for LD2410 variants on CardPuter
+
+  Features:
+  - Command/ACK parser: FD FC FB FA ... 04 03 02 01
+  - Strict data parser:  F4 F3 F2 F1 + len(LE) + payload + F8 F7 F6 F5
+  - Auto-fallback parser: scans stream for [type(01/02),AA,...,55,00]
+  - MyLD2410-compatible payload decode
+  - Presence from target state + metric support
+  - UI + runtime controls
+
+  Keys:
+    E : send engineering ON command (0x62)
+    N : send engineering OFF command (0x63)
+    R : send reboot command (0xA3)
+    C : cycle metric mode
+    W/Q : threshold +/- 
+    A/S : window /2 or *2
+    Space : calibration
+    Esc : reboot CardPuter
+*/
+
 #include <M5Cardputer.h>
 #include <Wire.h>
 
 // ============================================================
-// CardPuter + LD2410 (MyLD2410-compatible frame parsing)
+// Pins / serial
 // ============================================================
-#define SENSOR_RX_PIN 15   // CardPuter GPIO15 <- Sensor TX
-#define SENSOR_TX_PIN 13   // CardPuter GPIO13 -> Sensor RX
+#define SENSOR_RX_PIN 15
+#define SENSOR_TX_PIN 13
 
 const unsigned long LOG_BAUD = 115200;
-const int SENSOR_BAUD = 256000; // LD2410 default
+const int SENSOR_BAUD = 256000;
 
 HardwareSerial ld2410(1);
 M5Canvas canvas(&M5Cardputer.Display);
 
-// ---------------- UI / state ----------------
+// ============================================================
+// Protocol constants
+// ============================================================
+// Config/ACK envelope
+const uint8_t CFG_HEAD[4] = {0xFD, 0xFC, 0xFB, 0xFA};
+const uint8_t CFG_TAIL[4] = {0x04, 0x03, 0x02, 0x01};
+
+// Strict data envelope (MyLD2410)
+const uint8_t DATA_HEAD[4] = {0xF4, 0xF3, 0xF2, 0xF1};
+const uint8_t DATA_TAIL[4] = {0xF8, 0xF7, 0xF6, 0xF5};
+
+const size_t MAX_FRAME = 512;
+
+// ============================================================
+// UI / runtime state
+// ============================================================
 String statusMessage = "Ready";
 unsigned long lastKeyTime = 0;
 const unsigned long KEY_DELAY_MS = 180;
 
 bool anyDataReceived = false;
 unsigned long lastDataMs = 0;
-unsigned long frameCount = 0;
+unsigned long rawByteCount = 0;
 
-// ---------------- protocol constants ----------------
-// Config/ACK frames
-const uint8_t CFG_HEAD[4] = {0xFD, 0xFC, 0xFB, 0xFA};
-const uint8_t CFG_TAIL[4] = {0x04, 0x03, 0x02, 0x01};
+// Parser health
+unsigned long parsedDataFrames = 0;
+unsigned long parsedAckFrames = 0;
+unsigned long parseFailCount = 0;
+unsigned long lastParsedMs = 0;
+bool fallbackMode = false;   // auto enabled if strict parser starves
+const unsigned long FALLBACK_TIMEOUT_MS = 1500;
 
-// Data frames (MyLD2410)
-const uint8_t DATA_HEAD[4] = {0xF4, 0xF3, 0xF2, 0xF1};
-const uint8_t DATA_TAIL[4] = {0xF8, 0xF7, 0xF6, 0xF5};
-
-const size_t MAX_FRAME = 512;
-
-// ---------------- detection / metrics ----------------
+// ============================================================
+// Detection / metric
+// ============================================================
 enum MetricMode { METRIC_STATUS = 0, METRIC_BASE_ENERGY = 1, METRIC_GATE_SUM = 2 };
 MetricMode metricMode = METRIC_STATUS;
 
 int personWindowFrames = 8;
 const int MAX_WINDOW = 512;
 unsigned long metricBuf[MAX_WINDOW];
-int metricIdx = 0, metricCount = 0;
+int metricIdx = 0;
+int metricCount = 0;
 unsigned long metricSum = 0;
 
-unsigned long personThreshold = 1; // for non-status metrics
+unsigned long personThreshold = 1; // default works for METRIC_STATUS
 bool autoBaselineEnabled = true;
 float baselineFactor = 1.8f;
 bool hasBaseline = false;
@@ -53,45 +91,58 @@ unsigned long lastMetric = 0;
 bool personDetected = false;
 bool enhancedModeSeen = false;
 
-// ---------------- parsed report data ----------------
+// ============================================================
+// Parsed payload model
+// ============================================================
 struct ParsedData {
   bool ok = false;
   bool enhanced = false;    // type=0x01
-  uint8_t type = 0;
-  uint8_t status = 0xFF;    // 0..3 valid target states
+  uint8_t type = 0;         // 0x01 enhanced, 0x02 normal
+  uint8_t status = 0xFF;    // 0=no target,1=moving,2=stationary,3=both
 
-  uint16_t mDist = 0;       // moving distance cm
-  uint8_t  mSig = 0;        // moving energy
-  uint16_t sDist = 0;       // stationary distance cm
-  uint8_t  sSig = 0;        // stationary energy
-  uint16_t dist = 0;        // detected distance cm
+  uint16_t mDist = 0;
+  uint8_t  mSig = 0;
+  uint16_t sDist = 0;
+  uint8_t  sSig = 0;
+  uint16_t dist = 0;
 
   uint8_t mN = 0;
   uint8_t sN = 0;
-  uint8_t mG[9] = {0};      // gate energies moving
-  uint8_t sG[9] = {0};      // gate energies stationary
+  uint8_t mG[9] = {0};
+  uint8_t sG[9] = {0};
   uint8_t light = 0;
   uint8_t out = 0;
-} d;
+} gData;
 
-// ---------------- parser states ----------------
+// ============================================================
+// Generic strict frame parser state
+// ============================================================
 enum ParseState { SEARCH_HEAD, READ_LEN0, READ_LEN1, READ_BODY };
 struct StreamParser {
   ParseState state = SEARCH_HEAD;
   uint8_t headMatch = 0;
-  uint16_t expectedLen = 0; // payload length
-  uint16_t readCount = 0;   // payload + tail bytes read
+  uint16_t expectedLen = 0;
+  uint16_t readCount = 0;
   uint8_t payload[MAX_FRAME];
   uint8_t tail[4];
 };
 
-// one parser for cfg/ack, one for data
 StreamParser cfgParser;
 StreamParser dataParser;
 
 // ============================================================
-// helpers
+// Fallback extractor ring buffer
 // ============================================================
+const size_t RAW_RING_MAX = 1024;
+uint8_t rawRing[RAW_RING_MAX];
+size_t rawLen = 0;
+
+// ============================================================
+// Helpers
+// ============================================================
+void metricReset() {
+  metricIdx = 0; metricCount = 0; metricSum = 0;
+}
 void metricAdd(unsigned long v) {
   if (personWindowFrames < 1) personWindowFrames = 1;
   if (personWindowFrames > MAX_WINDOW) personWindowFrames = MAX_WINDOW;
@@ -112,17 +163,19 @@ void metricAdd(unsigned long v) {
 unsigned long metricAvg() {
   return (metricCount == 0) ? 0 : metricSum / metricCount;
 }
-void metricReset() {
-  metricIdx = 0; metricCount = 0; metricSum = 0;
-}
-
-bool endsWith4(const uint8_t *arr, const uint8_t *pat) {
-  for (int i = 0; i < 4; ++i) if (arr[i] != pat[i]) return false;
+bool arr4eq(const uint8_t *a, const uint8_t *b) {
+  for (int i = 0; i < 4; ++i) if (a[i] != b[i]) return false;
   return true;
+}
+void resetParser(StreamParser &ps) {
+  ps.state = SEARCH_HEAD;
+  ps.headMatch = 0;
+  ps.expectedLen = 0;
+  ps.readCount = 0;
 }
 
 // ============================================================
-// payload parse (MyLD2410 offsets)
+// Payload parser (MyLD2410-compatible)
 // ============================================================
 bool parseDataPayload(const uint8_t *p, size_t len, ParsedData &out) {
   out = ParsedData();
@@ -163,10 +216,9 @@ bool parseDataPayload(const uint8_t *p, size_t len, ParsedData &out) {
 }
 
 // ============================================================
-// detection update
+// Detection update
 // ============================================================
-void updateDetectionFromParsed(const ParsedData &pd) {
-  // Primary truth from status (table 12): 1,2,3 => target
+void updateDetection(const ParsedData &pd) {
   bool statusPresence = (pd.status >= 1 && pd.status <= 3);
 
   unsigned long metric = 0;
@@ -195,21 +247,19 @@ void updateDetectionFromParsed(const ParsedData &pd) {
   if (hasBaseline && autoBaselineEnabled) metricPresence = (avg > (unsigned long)(baselineValue * baselineFactor));
   else metricPresence = (avg >= personThreshold);
 
-  // combine: status presence is authoritative, metric presence supports robustness
   personDetected = statusPresence || metricPresence;
 
-  Serial.printf(
-      "\n[DATA] type=%02X status=%u mDist=%u mSig=%u sDist=%u sSig=%u dist=%u enh=%s metric=%lu avg=%lu detected=%s\n",
-      pd.type, pd.status, pd.mDist, pd.mSig, pd.sDist, pd.sSig, pd.dist,
-      pd.enhanced ? "YES" : "no", metric, avg, personDetected ? "YES" : "no");
+  Serial.printf("\n[PARSED] type=%02X st=%u mD=%u mE=%u sD=%u sE=%u d=%u enh=%s metric=%lu avg=%lu det=%s\n",
+                pd.type, pd.status, pd.mDist, pd.mSig, pd.sDist, pd.sSig, pd.dist,
+                pd.enhanced ? "YES" : "no", metric, avg, personDetected ? "YES" : "no");
 }
 
 // ============================================================
-// complete frame handlers
+// Frame handlers
 // ============================================================
 void onCfgFrame(const uint8_t *payload, uint16_t len) {
-  // payload typically: cmd(2) + status(2) + extra...
-  Serial.printf("\n[ACK] len=%u payload:", (unsigned)len);
+  parsedAckFrames++;
+  Serial.printf("\n[ACK] len=%u:", (unsigned)len);
   for (uint16_t i = 0; i < len; ++i) Serial.printf(" %02X", payload[i]);
   Serial.println();
 
@@ -220,31 +270,27 @@ void onCfgFrame(const uint8_t *payload, uint16_t len) {
   }
 }
 
-void onDataFrame(const uint8_t *payload, uint16_t len) {
-  frameCount++;
-  anyDataReceived = true;
-  lastDataMs = millis();
-
+void onDataPayload(const uint8_t *payload, uint16_t len) {
   ParsedData p;
   if (parseDataPayload(payload, len, p)) {
-    d = p;
+    gData = p;
     enhancedModeSeen = p.enhanced;
-    updateDetectionFromParsed(p);
+    parsedDataFrames++;
+    lastParsedMs = millis();
+    updateDetection(p);
   } else {
-    Serial.printf("\n[DATA] parse failed, len=%u\n", (unsigned)len);
+    parseFailCount++;
   }
 }
 
-// ============================================================
-// generic parser feed
-// ============================================================
-void resetParser(StreamParser &ps) {
-  ps.state = SEARCH_HEAD;
-  ps.headMatch = 0;
-  ps.expectedLen = 0;
-  ps.readCount = 0;
+void onDataFrame(const uint8_t *payload, uint16_t len) {
+  // strict frame payload -> parse directly
+  onDataPayload(payload, len);
 }
 
+// ============================================================
+// Strict parser feed
+// ============================================================
 void feedParserByte(
     StreamParser &ps,
     uint8_t b,
@@ -289,11 +335,8 @@ void feedParserByte(
       ps.readCount++;
 
       if (ps.readCount >= ps.expectedLen + 4) {
-        if (endsWith4(ps.tail, tail)) {
-          onFrame(ps.payload, ps.expectedLen);
-        } else {
-          Serial.println("\n[PARSER] tail mismatch");
-        }
+        if (arr4eq(ps.tail, tail)) onFrame(ps.payload, ps.expectedLen);
+        else parseFailCount++;
         resetParser(ps);
       }
       break;
@@ -301,10 +344,47 @@ void feedParserByte(
 }
 
 // ============================================================
-// command send
+// Fallback extractor: detect [01/02, AA, ..., 55, 00]
+// ============================================================
+void feedByteToFallbackExtractor(uint8_t b) {
+  if (rawLen < RAW_RING_MAX) rawRing[rawLen++] = b;
+  else {
+    memmove(rawRing, rawRing + 1, RAW_RING_MAX - 1);
+    rawRing[RAW_RING_MAX - 1] = b;
+    rawLen = RAW_RING_MAX;
+  }
+
+  // scan packet candidates
+  for (size_t i = 1; i + 4 < rawLen; ++i) {
+    uint8_t type = rawRing[i - 1];
+    if (!((type == 0x01) || (type == 0x02))) continue;
+    if (rawRing[i] != 0xAA) continue;
+
+    for (size_t j = i + 1; j + 1 < rawLen; ++j) {
+      if (rawRing[j] == 0x55 && rawRing[j + 1] == 0x00) {
+        size_t start = i - 1;
+        size_t end = j + 1;
+        size_t pktLen = end - start + 1;
+        if (pktLen >= 11 && pktLen <= 160) {
+          uint8_t tmp[160];
+          memcpy(tmp, rawRing + start, pktLen);
+          onDataPayload(tmp, (uint16_t)pktLen);
+
+          // consume through end
+          size_t remain = rawLen - (end + 1);
+          memmove(rawRing, rawRing + end + 1, remain);
+          rawLen = remain;
+          return;
+        }
+      }
+    }
+  }
+}
+
+// ============================================================
+// Commands
 // ============================================================
 void sendCfgCommandRaw(const uint8_t *cmd, uint8_t cmdLen) {
-  // cmd already includes: [lenL,lenH,cmdL,cmdH,...]
   ld2410.write(CFG_HEAD, 4);
   ld2410.write(cmd, cmdLen);
   ld2410.write(CFG_TAIL, 4);
@@ -312,47 +392,53 @@ void sendCfgCommandRaw(const uint8_t *cmd, uint8_t cmdLen) {
 }
 
 void sendEnableEngineering() {
-  // 02 00 62 00
   const uint8_t cmd[] = {0x02, 0x00, 0x62, 0x00};
   sendCfgCommandRaw(cmd, sizeof(cmd));
   statusMessage = "Sent eng ON";
-  Serial.println("[CMD] enable engineering sent");
+  Serial.println("[CMD] eng ON sent");
 }
 void sendDisableEngineering() {
-  // 02 00 63 00
   const uint8_t cmd[] = {0x02, 0x00, 0x63, 0x00};
   sendCfgCommandRaw(cmd, sizeof(cmd));
   statusMessage = "Sent eng OFF";
-  Serial.println("[CMD] disable engineering sent");
+  Serial.println("[CMD] eng OFF sent");
 }
 void sendRebootSensor() {
-  // 02 00 A3 00
   const uint8_t cmd[] = {0x02, 0x00, 0xA3, 0x00};
   sendCfgCommandRaw(cmd, sizeof(cmd));
   statusMessage = "Sent sensor reboot";
-  Serial.println("[CMD] reboot sensor sent");
+  Serial.println("[CMD] sensor reboot sent");
 }
 
 // ============================================================
-// calibration
+// Calibration
 // ============================================================
 void runCalibration(int frames = 12) {
   if (frames < 1) frames = 1;
   metricReset();
+  Serial.printf("[CAL] collecting %d parsed frames...\n", frames);
 
-  Serial.printf("[CAL] collecting %d frames...\n", frames);
   unsigned long start = millis();
-  unsigned long timeout = 8000;
+  unsigned long timeout = 10000;
+  int before = metricCount;
 
-  while (metricCount < frames && (millis() - start) < timeout) {
-    // allow loop parsing to continue naturally
+  while ((metricCount - before) < frames && (millis() - start) < timeout) {
     M5Cardputer.update();
     while (ld2410.available()) {
       uint8_t b = (uint8_t)ld2410.read();
+      rawByteCount++;
+      anyDataReceived = true;
+      lastDataMs = millis();
 
-      // keep both parsers alive during calibration
-      feedParserByte(cfgParser,  b, CFG_HEAD,  CFG_TAIL,  onCfgFrame);
-      feedParserByte(dataParser, b, DATA_HEAD, DATA_TAIL, onDataFrame);
+      feedParserByte(cfgParser, b, CFG_HEAD, CFG_TAIL, onCfgFrame);
+      if (!fallbackMode) feedParserByte(dataParser, b, DATA_HEAD, DATA_TAIL, onDataFrame);
+      else feedByteToFallbackExtractor(b);
+    }
+
+    if (!fallbackMode && (millis() - lastParsedMs > FALLBACK_TIMEOUT_MS)) {
+      fallbackMode = true;
+      statusMessage = "Fallback parser ON";
+      Serial.println("[PARSER] fallback enabled during calibration");
     }
     delay(5);
   }
@@ -363,10 +449,9 @@ void runCalibration(int frames = 12) {
     Serial.printf("[CAL] baseline=%lu factor=%.2f\n", baselineValue, baselineFactor);
     statusMessage = "Calibration done";
   } else {
-    Serial.println("[CAL] failed (no frames)");
+    Serial.println("[CAL] failed (no parsed frames)");
     statusMessage = "Calibration failed";
   }
-
   metricReset();
 }
 
@@ -383,22 +468,26 @@ void drawUI() {
       (metricMode == METRIC_BASE_ENERGY) ? "BASE_E" : "GATE_SUM";
 
   canvas.setCursor(4, 4);
-  canvas.printf("LD2410 Parser (MyLD2410 style)");
+  canvas.printf("LD2410 Hybrid Parser");
 
-  canvas.setCursor(4, 18);
+  canvas.setCursor(4, 16);
   canvas.printf("Mode:%s Win:%d Thr:%lu", modeName, personWindowFrames, personThreshold);
 
-  canvas.setCursor(4, 30);
-  canvas.printf("Baseline:%lu EngSeen:%s", baselineValue, enhancedModeSeen ? "YES" : "no");
+  canvas.setCursor(4, 28);
+  canvas.printf("Base:%lu Eng:%s Fallback:%s",
+                baselineValue,
+                enhancedModeSeen ? "Y" : "N",
+                fallbackMode ? "ON" : "off");
 
-  canvas.setCursor(4, 42);
-  canvas.printf("Frames:%lu LastMetric:%lu", frameCount, lastMetric);
+  canvas.setCursor(4, 40);
+  canvas.printf("ParsedD:%lu ACK:%lu Fail:%lu",
+                parsedDataFrames, parsedAckFrames, parseFailCount);
 
-  canvas.setCursor(4, 54);
-  canvas.printf("Status:%u mD:%u sD:%u d:%u", d.status, d.mDist, d.sDist, d.dist);
+  canvas.setCursor(4, 52);
+  canvas.printf("st:%u mD:%u sD:%u d:%u", gData.status, gData.mDist, gData.sDist, gData.dist);
 
-  canvas.setCursor(4, 66);
-  canvas.printf("mSig:%u sSig:%u", d.mSig, d.sSig);
+  canvas.setCursor(4, 64);
+  canvas.printf("mE:%u sE:%u lastM:%lu", gData.mSig, gData.sSig, lastMetric);
 
   canvas.setTextSize(2);
   canvas.setCursor(4, 84);
@@ -423,7 +512,7 @@ void drawUI() {
 // ============================================================
 void setup() {
   Serial.begin(LOG_BAUD);
-  Serial.println("\n=== CardPuter LD2410 full parser ===");
+  Serial.println("\n=== CardPuter LD2410 Final Hybrid ===");
 
   auto cfg = M5.config();
   M5Cardputer.begin(cfg, true);
@@ -438,32 +527,50 @@ void setup() {
   resetParser(cfgParser);
   resetParser(dataParser);
   metricReset();
+  rawLen = 0;
 
-  statusMessage = "Ready. E/N/R, C, WQ, AS, Space";
-  Serial.println("[INIT] keys: E engON, N engOFF, R sensor reboot, C mode, W/Q thr, A/S window, Space calib, Esc reboot");
+  lastParsedMs = millis();
+  statusMessage = "Ready: E/N/R C WQ AS Space Esc";
+
+  Serial.println("[INIT] keys: E engON, N engOFF, R reboot sensor, C mode, W/Q thr, A/S window, Space calib, Esc reboot");
 }
 
 void loop() {
   M5Cardputer.update();
 
-  // parse all incoming bytes using both parsers
   while (ld2410.available()) {
     uint8_t b = (uint8_t)ld2410.read();
 
-    // optional raw byte print:
+    rawByteCount++;
+    anyDataReceived = true;
+    lastDataMs = millis();
+
+    // raw hex output
     if (b < 16) Serial.print("0");
     Serial.print(b, HEX);
     Serial.print(" ");
+    if (rawByteCount % 32 == 0) Serial.println();
 
-    feedParserByte(cfgParser,  b, CFG_HEAD,  CFG_TAIL,  onCfgFrame);
-    feedParserByte(dataParser, b, DATA_HEAD, DATA_TAIL, onDataFrame);
+    // always parse config ack frames
+    feedParserByte(cfgParser, b, CFG_HEAD, CFG_TAIL, onCfgFrame);
+
+    // data parser path
+    if (!fallbackMode) feedParserByte(dataParser, b, DATA_HEAD, DATA_TAIL, onDataFrame);
+    else feedByteToFallbackExtractor(b);
+  }
+
+  // auto fallback when strict parser starves
+  if (!fallbackMode && (millis() - lastParsedMs > FALLBACK_TIMEOUT_MS)) {
+    fallbackMode = true;
+    statusMessage = "Fallback parser ON";
+    Serial.println("\n[PARSER] strict parser starved -> fallback ON");
   }
 
   if (anyDataReceived && (millis() - lastDataMs > 2000)) {
     statusMessage = "No recent data";
   }
 
-  // keyboard
+  // keyboard controls
   if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
     auto ks = M5Cardputer.Keyboard.keysState();
     for (auto k : ks.word) {
@@ -477,29 +584,23 @@ void loop() {
         metricMode = (MetricMode)((metricMode + 1) % 3);
         metricReset();
         statusMessage = "Metric mode changed";
-      }
-      else if (k == 'w' || k == 'W') {
+      } else if (k == 'w' || k == 'W') {
         personThreshold++;
         statusMessage = "Threshold++";
-      }
-      else if (k == 'q' || k == 'Q') {
+      } else if (k == 'q' || k == 'Q') {
         if (personThreshold > 0) personThreshold--;
         statusMessage = "Threshold--";
-      }
-      else if (k == 'a' || k == 'A') {
+      } else if (k == 'a' || k == 'A') {
         personWindowFrames = max(1, personWindowFrames / 2);
         metricReset();
         statusMessage = "Window down";
-      }
-      else if (k == 's' || k == 'S') {
+      } else if (k == 's' || k == 'S') {
         personWindowFrames = min(MAX_WINDOW, personWindowFrames * 2);
         metricReset();
         statusMessage = "Window up";
-      }
-      else if (k == ' ') {
+      } else if (k == ' ') {
         runCalibration(12);
-      }
-      else if (k == '\x1B') {
+      } else if (k == '\x1B') {
         esp_restart();
       }
     }
