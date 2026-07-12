@@ -138,11 +138,6 @@ uint16_t cmdPayloadLen = 0;
 uint16_t cmdPayloadIdx = 0;
 uint8_t cmdPayloadBuf[MAX_PAYLOAD];
 
-// ---------------- Report parser state ----------------
-//enum ReportParseState { R_SEARCH_HEAD = 0, R_IN_FRAME };
-//ReportParseState rParseState = R_SEARCH_HEAD;
-//uint8_t reportBuf[REPORT_MAX];
-//size_t reportIdx = 0;
 
 // last payload for interframe diff mode
 uint8_t lastPayloadBuf[MAX_PAYLOAD];
@@ -368,39 +363,7 @@ void feedByteToCmdParser(uint8_t b) {
   }
 }
 
-// -------------------------------------------------------------
-// Report parser (0xAA ... 0x55)
-// -------------------------------------------------------------
-/*void reportFeedByte(uint8_t b) {
-  switch (rParseState) {
-    case R_SEARCH_HEAD:
-      if (b == REPORT_HEAD) {
-        rParseState = R_IN_FRAME;
-        reportIdx = 0;
-      }
-      break;
 
-    case R_IN_FRAME:
-      if (b == REPORT_TAIL) {
-        // complete report payload in reportBuf[0..reportIdx-1]
-        if (reportIdx > 0) {
-          processReportFrame(reportBuf, (uint16_t)reportIdx);
-        }
-        rParseState = R_SEARCH_HEAD;
-        reportIdx = 0;
-      } else {
-        if (reportIdx < REPORT_MAX) {
-          reportBuf[reportIdx++] = b;
-        } else {
-          Serial.println("[REPORT-PARSER] Buffer overflow, resync");
-          rParseState = R_SEARCH_HEAD;
-          reportIdx = 0;
-        }
-      }
-      break;
-  }
-}
-*/
 // -------------------------------------------------------------
 // Process report payload (target/gate data)
 // -------------------------------------------------------------
