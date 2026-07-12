@@ -35,6 +35,31 @@ struct ParsedLd2410Report {
   uint8_t outLevel = 0;   // optional enhanced tail
 };
 
+// ---------------- Data frame parser state (outer report framing) ----------------
+// Outer data frame format (MyLD2410 style):
+// Header: F4 F3 F2 F1
+// Length: 2 bytes little-endian
+// Payload: <length> bytes
+// Tail: F8 F7 F6 F5
+
+const uint8_t DATA_HEADER[4] = {0xF4, 0xF3, 0xF2, 0xF1};
+const uint8_t DATA_TAIL[4]   = {0xF8, 0xF7, 0xF6, 0xF5};
+const size_t DATA_PAYLOAD_MAX = 512; // realistic upper bound; safe for LD2410
+
+enum DataParseState {
+  D_SEARCH_HEADER = 0,
+  D_READ_LEN_0,
+  D_READ_LEN_1,
+  D_READ_PAYLOAD_AND_TAIL
+};
+
+DataParseState dataParseState = D_SEARCH_HEADER;
+uint8_t dataHeaderMatchIdx = 0;
+uint16_t dataExpectedLen = 0;       // payload length from frame
+uint16_t dataReadCount = 0;         // bytes read in payload+tail phase
+uint8_t dataPayloadBuf[DATA_PAYLOAD_MAX];
+uint8_t dataTailBuf[4];
+
 // ============================================================
 // PIN & CONFIGURATION DEFINITIONS
 // ============================================================
@@ -114,10 +139,10 @@ uint16_t cmdPayloadIdx = 0;
 uint8_t cmdPayloadBuf[MAX_PAYLOAD];
 
 // ---------------- Report parser state ----------------
-enum ReportParseState { R_SEARCH_HEAD = 0, R_IN_FRAME };
-ReportParseState rParseState = R_SEARCH_HEAD;
-uint8_t reportBuf[REPORT_MAX];
-size_t reportIdx = 0;
+//enum ReportParseState { R_SEARCH_HEAD = 0, R_IN_FRAME };
+//ReportParseState rParseState = R_SEARCH_HEAD;
+//uint8_t reportBuf[REPORT_MAX];
+//size_t reportIdx = 0;
 
 // last payload for interframe diff mode
 uint8_t lastPayloadBuf[MAX_PAYLOAD];
@@ -346,7 +371,7 @@ void feedByteToCmdParser(uint8_t b) {
 // -------------------------------------------------------------
 // Report parser (0xAA ... 0x55)
 // -------------------------------------------------------------
-void reportFeedByte(uint8_t b) {
+/*void reportFeedByte(uint8_t b) {
   switch (rParseState) {
     case R_SEARCH_HEAD:
       if (b == REPORT_HEAD) {
@@ -375,7 +400,7 @@ void reportFeedByte(uint8_t b) {
       break;
   }
 }
-
+*/
 // -------------------------------------------------------------
 // Process report payload (target/gate data)
 // -------------------------------------------------------------
@@ -427,6 +452,73 @@ void processReportFrame(uint8_t *buf, uint16_t len) {
   addMetric(metric);
   unsigned long avg = metricsAverage();
   personDetected = (avg >= personThreshold);
+}
+
+void resetDataParser() {
+  dataParseState = D_SEARCH_HEADER;
+  dataHeaderMatchIdx = 0;
+  dataExpectedLen = 0;
+  dataReadCount = 0;
+}
+
+bool dataTailValid() {
+  for (int i = 0; i < 4; ++i) {
+    if (dataTailBuf[i] != DATA_TAIL[i]) return false;
+  }
+  return true;
+}
+
+void feedByteToDataParser(uint8_t b) {
+  switch (dataParseState) {
+    case D_SEARCH_HEADER:
+      if (b == DATA_HEADER[dataHeaderMatchIdx]) {
+        dataHeaderMatchIdx++;
+        if (dataHeaderMatchIdx == 4) {
+          dataParseState = D_READ_LEN_0;
+          dataHeaderMatchIdx = 0;
+        }
+      } else {
+        dataHeaderMatchIdx = (b == DATA_HEADER[0]) ? 1 : 0;
+      }
+      break;
+
+    case D_READ_LEN_0:
+      dataExpectedLen = b; // low byte
+      dataParseState = D_READ_LEN_1;
+      break;
+
+    case D_READ_LEN_1:
+      dataExpectedLen |= ((uint16_t)b << 8); // high byte
+      if (dataExpectedLen == 0 || dataExpectedLen > DATA_PAYLOAD_MAX) {
+        Serial.printf("[DATA-PARSER] invalid payload len=%u, resync\n", (unsigned)dataExpectedLen);
+        resetDataParser();
+      } else {
+        dataReadCount = 0;
+        dataParseState = D_READ_PAYLOAD_AND_TAIL;
+      }
+      break;
+
+    case D_READ_PAYLOAD_AND_TAIL:
+      // First read payload bytes, then 4 tail bytes
+      if (dataReadCount < dataExpectedLen) {
+        dataPayloadBuf[dataReadCount] = b;
+      } else if (dataReadCount < dataExpectedLen + 4) {
+        dataTailBuf[dataReadCount - dataExpectedLen] = b;
+      }
+
+      dataReadCount++;
+
+      if (dataReadCount >= dataExpectedLen + 4) {
+        if (dataTailValid()) {
+          // Pass parsed payload to your inner parser
+          processReportFrame(dataPayloadBuf, dataExpectedLen);
+        } else {
+          Serial.println("[DATA-PARSER] tail mismatch");
+        }
+        resetDataParser();
+      }
+      break;
+  }
 }
 
 // -------------------------------------------------------------
@@ -642,7 +734,7 @@ void loop() {
 
     // Feed both parsers
     feedByteToCmdParser(b);  // for command/ACK frames
-    reportFeedByte(b);       // for report data frames (0xAA ... 0x55)
+    feedByteToDataParser(b);      // for report data frames (0xAA ... 0x55)
   }
 
   if (anyDataReceived && millis() - dataTimestamp > 2000) {
