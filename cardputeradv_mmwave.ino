@@ -1,26 +1,3 @@
-/*
-  cardputeradv_mmwave.ino
-  Final hybrid parser build for LD2410 variants on CardPuter
-
-  Features:
-  - Command/ACK parser: FD FC FB FA ... 04 03 02 01
-  - Strict data parser:  F4 F3 F2 F1 + len(LE) + payload + F8 F7 F6 F5
-  - Auto-fallback parser: scans stream for [type(01/02),AA,...,55,00]
-  - MyLD2410-compatible payload decode
-  - Presence from target state + metric support
-  - UI + runtime controls
-
-  Keys:
-    E : send engineering ON command (0x62)
-    N : send engineering OFF command (0x63)
-    R : send reboot command (0xA3)
-    C : cycle metric mode
-    W/Q : threshold +/- 
-    A/S : window /2 or *2
-    Space : calibration
-    Esc : reboot CardPuter
-*/
-
 #include <M5Cardputer.h>
 #include <Wire.h>
 
@@ -39,18 +16,16 @@ M5Canvas canvas(&M5Cardputer.Display);
 // ============================================================
 // Protocol constants
 // ============================================================
-// Config/ACK envelope
 const uint8_t CFG_HEAD[4] = {0xFD, 0xFC, 0xFB, 0xFA};
 const uint8_t CFG_TAIL[4] = {0x04, 0x03, 0x02, 0x01};
 
-// Strict data envelope (MyLD2410)
 const uint8_t DATA_HEAD[4] = {0xF4, 0xF3, 0xF2, 0xF1};
 const uint8_t DATA_TAIL[4] = {0xF8, 0xF7, 0xF6, 0xF5};
 
 const size_t MAX_FRAME = 512;
 
 // ============================================================
-// UI / runtime state
+// UI/runtime state
 // ============================================================
 String statusMessage = "Ready";
 unsigned long lastKeyTime = 0;
@@ -60,35 +35,32 @@ bool anyDataReceived = false;
 unsigned long lastDataMs = 0;
 unsigned long rawByteCount = 0;
 
-// Parser health
+// parser health
 unsigned long parsedDataFrames = 0;
 unsigned long parsedAckFrames = 0;
 unsigned long parseFailCount = 0;
+unsigned long fallbackExtractHits = 0;
 unsigned long lastParsedMs = 0;
-bool fallbackMode = false;   // auto enabled if strict parser starves
+bool fallbackMode = false;
 const unsigned long FALLBACK_TIMEOUT_MS = 1500;
 
+// fallback telemetry only
+unsigned long rawPatternMetric = 0;
+
 // ============================================================
-// Detection / metric
+// Target-first output
 // ============================================================
-enum MetricMode { METRIC_STATUS = 0, METRIC_BASE_ENERGY = 1, METRIC_GATE_SUM = 2 };
-MetricMode metricMode = METRIC_STATUS;
+enum TargetKind { TK_UNKNOWN=0, TK_NONE, TK_MOVING, TK_STATIC, TK_BOTH };
+TargetKind targetKind = TK_UNKNOWN;
 
-int personWindowFrames = 8;
-const int MAX_WINDOW = 512;
-unsigned long metricBuf[MAX_WINDOW];
-int metricIdx = 0;
-int metricCount = 0;
-unsigned long metricSum = 0;
+bool parsedStatusValid = false;
+uint8_t parsedStatus = 0xFF;
 
-unsigned long personThreshold = 1; // default works for METRIC_STATUS
-bool autoBaselineEnabled = true;
-float baselineFactor = 1.8f;
-bool hasBaseline = false;
-unsigned long baselineValue = 0;
-unsigned long lastMetric = 0;
-
-bool personDetected = false;
+uint16_t dispMovingDist = 0;
+uint16_t dispStaticDist = 0;
+uint16_t dispDetectDist = 0;
+uint8_t  dispMovingEnergy = 0;
+uint8_t  dispStaticEnergy = 0;
 bool enhancedModeSeen = false;
 
 // ============================================================
@@ -96,9 +68,9 @@ bool enhancedModeSeen = false;
 // ============================================================
 struct ParsedData {
   bool ok = false;
-  bool enhanced = false;    // type=0x01
-  uint8_t type = 0;         // 0x01 enhanced, 0x02 normal
-  uint8_t status = 0xFF;    // 0=no target,1=moving,2=stationary,3=both
+  bool enhanced = false;
+  uint8_t type = 0;
+  uint8_t status = 0xFF; // 0..3
 
   uint16_t mDist = 0;
   uint8_t  mSig = 0;
@@ -115,7 +87,7 @@ struct ParsedData {
 } gData;
 
 // ============================================================
-// Generic strict frame parser state
+// Strict parser state
 // ============================================================
 enum ParseState { SEARCH_HEAD, READ_LEN0, READ_LEN1, READ_BODY };
 struct StreamParser {
@@ -127,11 +99,10 @@ struct StreamParser {
   uint8_t tail[4];
 };
 
-StreamParser cfgParser;
-StreamParser dataParser;
+StreamParser cfgParser, dataParser;
 
 // ============================================================
-// Fallback extractor ring buffer
+// Fallback ring buffer
 // ============================================================
 const size_t RAW_RING_MAX = 1024;
 uint8_t rawRing[RAW_RING_MAX];
@@ -140,29 +111,6 @@ size_t rawLen = 0;
 // ============================================================
 // Helpers
 // ============================================================
-void metricReset() {
-  metricIdx = 0; metricCount = 0; metricSum = 0;
-}
-void metricAdd(unsigned long v) {
-  if (personWindowFrames < 1) personWindowFrames = 1;
-  if (personWindowFrames > MAX_WINDOW) personWindowFrames = MAX_WINDOW;
-
-  if (metricCount < personWindowFrames) {
-    metricBuf[metricIdx] = v;
-    metricSum += v;
-    metricIdx = (metricIdx + 1) % personWindowFrames;
-    metricCount++;
-  } else {
-    int rep = metricIdx % personWindowFrames;
-    metricSum -= metricBuf[rep];
-    metricBuf[rep] = v;
-    metricSum += v;
-    metricIdx = (rep + 1) % personWindowFrames;
-  }
-}
-unsigned long metricAvg() {
-  return (metricCount == 0) ? 0 : metricSum / metricCount;
-}
 bool arr4eq(const uint8_t *a, const uint8_t *b) {
   for (int i = 0; i < 4; ++i) if (a[i] != b[i]) return false;
   return true;
@@ -173,9 +121,30 @@ void resetParser(StreamParser &ps) {
   ps.expectedLen = 0;
   ps.readCount = 0;
 }
+const char* targetKindString(TargetKind tk) {
+  switch (tk) {
+    case TK_NONE: return "NONE";
+    case TK_MOVING: return "MOVING";
+    case TK_STATIC: return "STATIC";
+    case TK_BOTH: return "BOTH";
+    default: return "UNKNOWN";
+  }
+}
+
+unsigned long computeRawPatternMetric(const uint8_t* buf, size_t n) {
+  // telemetry only
+  unsigned long score = 0;
+  for (size_t i = 0; i < n; i++) {
+    uint8_t b = buf[i];
+    if (b == 0xC0 || b == 0xC6) score += 2;
+    else if (b == 0xFE || b == 0xF8) score += 2;
+    else if (b == 0x3E || b == 0x38 || b == 0x0E) score += 1;
+  }
+  return score;
+}
 
 // ============================================================
-// Payload parser (MyLD2410-compatible)
+// Payload parser (MyLD2410-like)
 // ============================================================
 bool parseDataPayload(const uint8_t *p, size_t len, ParsedData &out) {
   out = ParsedData();
@@ -216,42 +185,30 @@ bool parseDataPayload(const uint8_t *p, size_t len, ParsedData &out) {
 }
 
 // ============================================================
-// Detection update
+// Parsed target update (authoritative)
 // ============================================================
-void updateDetection(const ParsedData &pd) {
-  bool statusPresence = (pd.status >= 1 && pd.status <= 3);
+void updateTargetFromParsed(const ParsedData &pd) {
+  parsedStatusValid = true;
+  parsedStatus = pd.status;
 
-  unsigned long metric = 0;
-  switch (metricMode) {
-    case METRIC_STATUS:
-      metric = statusPresence ? 1 : 0;
-      break;
-    case METRIC_BASE_ENERGY:
-      metric = (unsigned long)pd.mSig + (unsigned long)pd.sSig;
-      break;
-    case METRIC_GATE_SUM:
-      if (pd.enhanced) {
-        for (uint8_t i = 0; i <= pd.mN; ++i) metric += pd.mG[i];
-        for (uint8_t i = 0; i <= pd.sN; ++i) metric += pd.sG[i];
-      } else {
-        metric = (unsigned long)pd.mSig + (unsigned long)pd.sSig;
-      }
-      break;
+  dispMovingDist = pd.mDist;
+  dispStaticDist = pd.sDist;
+  dispDetectDist = pd.dist;
+  dispMovingEnergy = pd.mSig;
+  dispStaticEnergy = pd.sSig;
+  enhancedModeSeen = pd.enhanced;
+
+  switch (pd.status) {
+    case 0: targetKind = TK_NONE; break;
+    case 1: targetKind = TK_MOVING; break;
+    case 2: targetKind = TK_STATIC; break;
+    case 3: targetKind = TK_BOTH; break;
+    default: targetKind = TK_UNKNOWN; break;
   }
 
-  lastMetric = metric;
-  metricAdd(metric);
-  unsigned long avg = metricAvg();
-
-  bool metricPresence = false;
-  if (hasBaseline && autoBaselineEnabled) metricPresence = (avg > (unsigned long)(baselineValue * baselineFactor));
-  else metricPresence = (avg >= personThreshold);
-
-  personDetected = statusPresence || metricPresence;
-
-  Serial.printf("\n[PARSED] type=%02X st=%u mD=%u mE=%u sD=%u sE=%u d=%u enh=%s metric=%lu avg=%lu det=%s\n",
-                pd.type, pd.status, pd.mDist, pd.mSig, pd.sDist, pd.sSig, pd.dist,
-                pd.enhanced ? "YES" : "no", metric, avg, personDetected ? "YES" : "no");
+  Serial.printf("\n[TARGET] %s st=%u mD=%u sD=%u d=%u mE=%u sE=%u\n",
+                targetKindString(targetKind), pd.status,
+                pd.mDist, pd.sDist, pd.dist, pd.mSig, pd.sSig);
 }
 
 // ============================================================
@@ -262,29 +219,21 @@ void onCfgFrame(const uint8_t *payload, uint16_t len) {
   Serial.printf("\n[ACK] len=%u:", (unsigned)len);
   for (uint16_t i = 0; i < len; ++i) Serial.printf(" %02X", payload[i]);
   Serial.println();
-
-  if (len >= 4) {
-    uint16_t cmd = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
-    uint16_t st  = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
-    Serial.printf("[ACK] cmd=0x%04X status=%u\n", cmd, st);
-  }
 }
 
 void onDataPayload(const uint8_t *payload, uint16_t len) {
   ParsedData p;
   if (parseDataPayload(payload, len, p)) {
     gData = p;
-    enhancedModeSeen = p.enhanced;
     parsedDataFrames++;
     lastParsedMs = millis();
-    updateDetection(p);
+    updateTargetFromParsed(p);
   } else {
     parseFailCount++;
   }
 }
 
 void onDataFrame(const uint8_t *payload, uint16_t len) {
-  // strict frame payload -> parse directly
   onDataPayload(payload, len);
 }
 
@@ -327,11 +276,8 @@ void feedParserByte(
       break;
 
     case READ_BODY:
-      if (ps.readCount < ps.expectedLen) {
-        ps.payload[ps.readCount] = b;
-      } else if (ps.readCount < ps.expectedLen + 4) {
-        ps.tail[ps.readCount - ps.expectedLen] = b;
-      }
+      if (ps.readCount < ps.expectedLen) ps.payload[ps.readCount] = b;
+      else if (ps.readCount < ps.expectedLen + 4) ps.tail[ps.readCount - ps.expectedLen] = b;
       ps.readCount++;
 
       if (ps.readCount >= ps.expectedLen + 4) {
@@ -344,7 +290,7 @@ void feedParserByte(
 }
 
 // ============================================================
-// Fallback extractor: detect [01/02, AA, ..., 55, 00]
+// Fallback extractor (for recovery only)
 // ============================================================
 void feedByteToFallbackExtractor(uint8_t b) {
   if (rawLen < RAW_RING_MAX) rawRing[rawLen++] = b;
@@ -354,7 +300,17 @@ void feedByteToFallbackExtractor(uint8_t b) {
     rawLen = RAW_RING_MAX;
   }
 
-  // scan packet candidates
+  // raw metric telemetry only
+  if (rawLen >= 64) {
+    rawPatternMetric = computeRawPatternMetric(rawRing + (rawLen - 64), 64);
+    static unsigned long lastDbg = 0;
+    if (millis() - lastDbg > 700) {
+      lastDbg = millis();
+      Serial.printf("\n[FALLBACK-RAW] metric=%lu (telemetry only)\n", rawPatternMetric);
+    }
+  }
+
+  // recover packets by pattern [type=01/02][AA] ... [55][00]
   for (size_t i = 1; i + 4 < rawLen; ++i) {
     uint8_t type = rawRing[i - 1];
     if (!((type == 0x01) || (type == 0x02))) continue;
@@ -365,12 +321,13 @@ void feedByteToFallbackExtractor(uint8_t b) {
         size_t start = i - 1;
         size_t end = j + 1;
         size_t pktLen = end - start + 1;
+
         if (pktLen >= 11 && pktLen <= 160) {
           uint8_t tmp[160];
           memcpy(tmp, rawRing + start, pktLen);
+          fallbackExtractHits++;
           onDataPayload(tmp, (uint16_t)pktLen);
 
-          // consume through end
           size_t remain = rawLen - (end + 1);
           memmove(rawRing, rawRing + end + 1, remain);
           rawLen = remain;
@@ -390,7 +347,6 @@ void sendCfgCommandRaw(const uint8_t *cmd, uint8_t cmdLen) {
   ld2410.write(CFG_TAIL, 4);
   ld2410.flush();
 }
-
 void sendEnableEngineering() {
   const uint8_t cmd[] = {0x02, 0x00, 0x62, 0x00};
   sendCfgCommandRaw(cmd, sizeof(cmd));
@@ -411,51 +367,6 @@ void sendRebootSensor() {
 }
 
 // ============================================================
-// Calibration
-// ============================================================
-void runCalibration(int frames = 12) {
-  if (frames < 1) frames = 1;
-  metricReset();
-  Serial.printf("[CAL] collecting %d parsed frames...\n", frames);
-
-  unsigned long start = millis();
-  unsigned long timeout = 10000;
-  int before = metricCount;
-
-  while ((metricCount - before) < frames && (millis() - start) < timeout) {
-    M5Cardputer.update();
-    while (ld2410.available()) {
-      uint8_t b = (uint8_t)ld2410.read();
-      rawByteCount++;
-      anyDataReceived = true;
-      lastDataMs = millis();
-
-      feedParserByte(cfgParser, b, CFG_HEAD, CFG_TAIL, onCfgFrame);
-      if (!fallbackMode) feedParserByte(dataParser, b, DATA_HEAD, DATA_TAIL, onDataFrame);
-      else feedByteToFallbackExtractor(b);
-    }
-
-    if (!fallbackMode && (millis() - lastParsedMs > FALLBACK_TIMEOUT_MS)) {
-      fallbackMode = true;
-      statusMessage = "Fallback parser ON";
-      Serial.println("[PARSER] fallback enabled during calibration");
-    }
-    delay(5);
-  }
-
-  if (metricCount > 0) {
-    baselineValue = metricAvg();
-    hasBaseline = true;
-    Serial.printf("[CAL] baseline=%lu factor=%.2f\n", baselineValue, baselineFactor);
-    statusMessage = "Calibration done";
-  } else {
-    Serial.println("[CAL] failed (no parsed frames)");
-    statusMessage = "Calibration failed";
-  }
-  metricReset();
-}
-
-// ============================================================
 // UI
 // ============================================================
 void drawUI() {
@@ -463,44 +374,38 @@ void drawUI() {
   canvas.setTextSize(1);
   canvas.setTextColor(WHITE);
 
-  const char* modeName =
-      (metricMode == METRIC_STATUS) ? "STATUS" :
-      (metricMode == METRIC_BASE_ENERGY) ? "BASE_E" : "GATE_SUM";
-
   canvas.setCursor(4, 4);
-  canvas.printf("LD2410 Hybrid Parser");
+  canvas.printf("LD2410 Parsed-Only Target");
 
   canvas.setCursor(4, 16);
-  canvas.printf("Mode:%s Win:%d Thr:%lu", modeName, personWindowFrames, personThreshold);
+  canvas.printf("FB mode:%s parsedValid:%s", fallbackMode ? "ON":"off", parsedStatusValid ? "Y":"N");
 
   canvas.setCursor(4, 28);
-  canvas.printf("Base:%lu Eng:%s Fallback:%s",
-                baselineValue,
-                enhancedModeSeen ? "Y" : "N",
-                fallbackMode ? "ON" : "off");
+  canvas.printf("Parsed:%lu Ack:%lu Fail:%lu", parsedDataFrames, parsedAckFrames, parseFailCount);
 
   canvas.setCursor(4, 40);
-  canvas.printf("ParsedD:%lu ACK:%lu Fail:%lu",
-                parsedDataFrames, parsedAckFrames, parseFailCount);
-
-  canvas.setCursor(4, 52);
-  canvas.printf("st:%u mD:%u sD:%u d:%u", gData.status, gData.mDist, gData.sDist, gData.dist);
-
-  canvas.setCursor(4, 64);
-  canvas.printf("mE:%u sE:%u lastM:%lu", gData.mSig, gData.sSig, lastMetric);
+  canvas.printf("FB recover:%lu rawM:%lu", fallbackExtractHits, rawPatternMetric);
 
   canvas.setTextSize(2);
-  canvas.setCursor(4, 84);
-  if (personDetected) {
-    canvas.setTextColor(RED);
-    canvas.print("Person: YES");
-  } else {
-    canvas.setTextColor(GREEN);
-    canvas.print("Person: NO ");
-  }
+  canvas.setCursor(4, 68);
+  if (targetKind == TK_NONE) canvas.setTextColor(GREEN);
+  else if (targetKind == TK_UNKNOWN) canvas.setTextColor(YELLOW);
+  else canvas.setTextColor(RED);
+  canvas.printf("Target:%s", targetKindString(targetKind));
 
   canvas.setTextSize(1);
   canvas.setTextColor(WHITE);
+  canvas.setCursor(4, 96);
+  if (parsedStatusValid) {
+    canvas.printf("st:%u mD:%u sD:%u d:%u", parsedStatus, dispMovingDist, dispStaticDist, dispDetectDist);
+    canvas.setCursor(4, 108);
+    canvas.printf("mE:%u sE:%u eng:%s", dispMovingEnergy, dispStaticEnergy, enhancedModeSeen ? "Y":"N");
+  } else {
+    canvas.printf("No parsed status yet");
+    canvas.setCursor(4, 108);
+    canvas.printf("Distances/Energies unavailable");
+  }
+
   canvas.setCursor(4, canvas.height() - 14);
   canvas.printf("%s", statusMessage.c_str());
 
@@ -508,11 +413,11 @@ void drawUI() {
 }
 
 // ============================================================
-// setup / loop
+// Setup / loop
 // ============================================================
 void setup() {
   Serial.begin(LOG_BAUD);
-  Serial.println("\n=== CardPuter LD2410 Final Hybrid ===");
+  Serial.println("\n=== CardPuter LD2410 Parsed-Only ===");
 
   auto cfg = M5.config();
   M5Cardputer.begin(cfg, true);
@@ -526,13 +431,15 @@ void setup() {
 
   resetParser(cfgParser);
   resetParser(dataParser);
-  metricReset();
   rawLen = 0;
 
+  targetKind = TK_UNKNOWN;
+  parsedStatusValid = false;
+  parsedStatus = 0xFF;
   lastParsedMs = millis();
-  statusMessage = "Ready: E/N/R C WQ AS Space Esc";
 
-  Serial.println("[INIT] keys: E engON, N engOFF, R reboot sensor, C mode, W/Q thr, A/S window, Space calib, Esc reboot");
+  statusMessage = "Keys: E/N/R Esc";
+  Serial.println("[INIT] keys: E engON, N engOFF, R sensor reboot, Esc reboot");
 }
 
 void loop() {
@@ -545,32 +452,36 @@ void loop() {
     anyDataReceived = true;
     lastDataMs = millis();
 
-    // raw hex output
+    // raw stream debug
     if (b < 16) Serial.print("0");
     Serial.print(b, HEX);
     Serial.print(" ");
     if (rawByteCount % 32 == 0) Serial.println();
 
-    // always parse config ack frames
+    // always parse ACK path
     feedParserByte(cfgParser, b, CFG_HEAD, CFG_TAIL, onCfgFrame);
 
-    // data parser path
-    if (!fallbackMode) feedParserByte(dataParser, b, DATA_HEAD, DATA_TAIL, onDataFrame);
-    else feedByteToFallbackExtractor(b);
+    // strict parse first; keep fallback extractor warm in parallel
+    if (!fallbackMode) {
+      feedParserByte(dataParser, b, DATA_HEAD, DATA_TAIL, onDataFrame);
+      feedByteToFallbackExtractor(b);
+    } else {
+      feedByteToFallbackExtractor(b);
+    }
   }
 
-  // auto fallback when strict parser starves
+  // auto enable fallback only for recovery
   if (!fallbackMode && (millis() - lastParsedMs > FALLBACK_TIMEOUT_MS)) {
     fallbackMode = true;
-    statusMessage = "Fallback parser ON";
-    Serial.println("\n[PARSER] strict parser starved -> fallback ON");
+    statusMessage = "Fallback extractor ON";
+    Serial.println("\n[PARSER] strict starved -> fallback ON");
   }
 
   if (anyDataReceived && (millis() - lastDataMs > 2000)) {
     statusMessage = "No recent data";
   }
 
-  // keyboard controls
+  // keyboard
   if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
     auto ks = M5Cardputer.Keyboard.keysState();
     for (auto k : ks.word) {
@@ -580,29 +491,7 @@ void loop() {
       if (k == 'e' || k == 'E') sendEnableEngineering();
       else if (k == 'n' || k == 'N') sendDisableEngineering();
       else if (k == 'r' || k == 'R') sendRebootSensor();
-      else if (k == 'c' || k == 'C') {
-        metricMode = (MetricMode)((metricMode + 1) % 3);
-        metricReset();
-        statusMessage = "Metric mode changed";
-      } else if (k == 'w' || k == 'W') {
-        personThreshold++;
-        statusMessage = "Threshold++";
-      } else if (k == 'q' || k == 'Q') {
-        if (personThreshold > 0) personThreshold--;
-        statusMessage = "Threshold--";
-      } else if (k == 'a' || k == 'A') {
-        personWindowFrames = max(1, personWindowFrames / 2);
-        metricReset();
-        statusMessage = "Window down";
-      } else if (k == 's' || k == 'S') {
-        personWindowFrames = min(MAX_WINDOW, personWindowFrames * 2);
-        metricReset();
-        statusMessage = "Window up";
-      } else if (k == ' ') {
-        runCalibration(12);
-      } else if (k == '\x1B') {
-        esp_restart();
-      }
+      else if (k == '\x1B') esp_restart();
     }
   }
 
