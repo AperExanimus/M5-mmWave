@@ -1,13 +1,39 @@
 /*
   cardputeradv_mmwave.ino
-  Complete single-file sketch:
-  - Frame-aware parser
-  - Engineering-mode auto-detect and gate metrics
-  - Calibration and runtime controls
+  Full sketch:
+  - Command frame parser: FD FC FB FA ... 04 03 02 01
+  - Report frame parser: 0xAA ... 0x55  (per PDF pages 16-17)
+  - Engineering-mode detection + gate metrics
+  - Calibration + runtime controls
 */
 
 #include <M5Cardputer.h>
 #include <Wire.h>
+
+struct ParsedLd2410Report {
+  bool ok = false;
+  bool enhanced = false;      // true for type=0x01
+  uint8_t type = 0;           // 0x01 enhanced, 0x02 normal
+  uint8_t targetState = 0xFF; // table 12: 0=no target,1=moving,2=stationary,3=both
+
+  uint16_t movingDistanceCm = 0;
+  uint8_t  movingEnergy = 0;
+
+  uint16_t stationaryDistanceCm = 0;
+  uint8_t  stationaryEnergy = 0;
+
+  uint16_t detectionDistanceCm = 0;
+
+  uint8_t movingGateMax = 0;     // N
+  uint8_t stationaryGateMax = 0; // N
+
+  // 1-byte energies per gate (0..N), capped to 9 (gate 0..8 typical)
+  uint8_t movingGateEnergy[9] = {0};
+  uint8_t stationaryGateEnergy[9] = {0};
+
+  uint8_t lightLevel = 0; // optional enhanced tail
+  uint8_t outLevel = 0;   // optional enhanced tail
+};
 
 // ============================================================
 // PIN & CONFIGURATION DEFINITIONS
@@ -16,9 +42,8 @@
 #define SENSOR_TX_PIN 13   // CardPuter GPIO13 ← Sensor RX
 
 const unsigned long LOG_BAUD = 115200;
-const int SENSOR_BAUD = 256000; // sensor UART (change if needed)
+const int SENSOR_BAUD = 256000; // sensor UART
 
-// Serial connection to sensor
 HardwareSerial ld2410(1);
 
 String statusMessage = "Ready";
@@ -36,29 +61,35 @@ int validFrames = 0;
 
 M5Canvas canvas(&M5Cardputer.Display);
 
-// ----------------------- Frame parser config -----------------------
-const uint8_t FRAME_HEADER[4] = {0xFD, 0xFC, 0xFB, 0xFA};
-const uint8_t FRAME_FOOTER[4] = {0x04, 0x03, 0x02, 0x01};
-const size_t MAX_PAYLOAD = 4096; // safety limit for payload length
+// ----------------------- Command frame parser config -----------------------
+const uint8_t CMD_HEADER[4] = {0xFD, 0xFC, 0xFB, 0xFA};
+const uint8_t CMD_FOOTER[4] = {0x04, 0x03, 0x02, 0x01};
+const size_t MAX_PAYLOAD = 4096; // safety limit for command payload length
 
-// ---------------- Detection configuration (tuneable) ----------------
-int personWindowFrames = 8;     // sliding window size (frames)
-unsigned long personThreshold = 10;       // absolute fallback threshold (units vary by metric)
+// ----------------------- Report frame parser config -----------------------
+// Per PDF table: data frame contains Head=0xAA ... Tail=0x55
+const uint8_t REPORT_HEAD = 0xAA;
+const uint8_t REPORT_TAIL = 0x55;
+const size_t REPORT_MAX = 4096;
+
+// ---------------- Detection configuration ----------------
+int personWindowFrames = 8;
+unsigned long personThreshold = 10; // absolute fallback threshold
 bool autoBaselineEnabled = true;
-float baselineFactor = 2.0f;    // detection if avg > baseline * baselineFactor
+float baselineFactor = 2.0f;        // detection when avg > baseline * factor
 
-// engineering-mode detection
+// Engineering-mode detection (heuristic)
 bool engineeringDetected = false;
-const uint16_t ENGINEERING_LEN_THRESH = 120; // bytes (heuristic)
+const uint16_t ENGINEERING_LEN_THRESH = 120; // report payload length heuristic
 int gateStart = 0;
-int gateEnd = -1; // -1 means use payloadLen-1
-int perGateThreshold = 10; // per-gate threshold for "count above" metric
+int gateEnd = -1;          // -1 => use end of payload
+int perGateThreshold = 10; // for countAbove logging
 
 // ---------------- Metric modes ----------------
 enum MetricMode { INTERFRAME_DIFF = 0, PAYLOAD_SUM = 1, NONZERO_COUNT = 2 };
 MetricMode metricMode = INTERFRAME_DIFF;
 
-// Buffers and sliding-window metric storage
+// Sliding window metric storage
 const int MAX_WINDOW = 512;
 unsigned long metricsBuf[MAX_WINDOW];
 int metricsIdx = 0;
@@ -68,49 +99,50 @@ unsigned long metricsSum = 0;
 bool personDetected = false;
 unsigned long lastFrameMetric = 0;
 
-// Baseline calibration state
+// Baseline state
 unsigned long baselineValue = 0;
 bool hasBaseline = false;
 
-// Parser state
-enum ParseState { SEARCH_HEADER, READ_LEN, READ_PAYLOAD, READ_FOOTER };
-ParseState parseState = SEARCH_HEADER;
-uint8_t headerMatchIdx = 0;
-uint8_t footerMatchIdx = 0;
-uint8_t lenBytes[2] = {0, 0};
-uint16_t payloadLen = 0;
-uint16_t payloadIdx = 0;
-uint8_t payloadBuf[MAX_PAYLOAD];
+// ---------------- Command parser state ----------------
+enum CmdParseState { CMD_SEARCH_HEADER, CMD_READ_LEN, CMD_READ_PAYLOAD, CMD_READ_FOOTER };
+CmdParseState cmdParseState = CMD_SEARCH_HEADER;
+uint8_t cmdHeaderMatchIdx = 0;
+uint8_t cmdFooterMatchIdx = 0;
+uint8_t cmdLenBytes[2] = {0, 0};
+uint16_t cmdPayloadLen = 0;
+uint16_t cmdPayloadIdx = 0;
+uint8_t cmdPayloadBuf[MAX_PAYLOAD];
 
-// last payload for INTERFRAME_DIFF
+// ---------------- Report parser state ----------------
+enum ReportParseState { R_SEARCH_HEAD = 0, R_IN_FRAME };
+ReportParseState rParseState = R_SEARCH_HEAD;
+uint8_t reportBuf[REPORT_MAX];
+size_t reportIdx = 0;
+
+// last payload for interframe diff mode
 uint8_t lastPayloadBuf[MAX_PAYLOAD];
 uint16_t lastPayloadLen = 0;
 
-// Forward declarations (no default args here)
-void resetParser();
-void feedByteToParser(uint8_t b);
-void processFrame(uint8_t *buf, uint16_t len);
+// Forward declarations
+void resetCmdParser();
+void feedByteToCmdParser(uint8_t b);
+void reportFeedByte(uint8_t b);
+void processReportFrame(uint8_t *buf, uint16_t len);
 void addMetric(unsigned long v);
 unsigned long metricsAverage();
+void resetMetricsBuffer(const char *msg);
+void runCalibration(int captureFrames = 8);
+
 unsigned long compute_interframe_diff(uint8_t *buf, uint16_t len);
 unsigned long compute_payload_sum(uint8_t *buf, uint16_t len);
 unsigned long compute_nonzero_count(uint8_t *buf, uint16_t len);
-void resetMetricsBuffer(const char *msg);
-void runCalibration(int captureFrames);
-void sendEnableEngineeringModeOnce(unsigned long timeoutMs);
 
-// ---------------- Parser helpers ----------------
-void resetParser() {
-  parseState = SEARCH_HEADER;
-  headerMatchIdx = 0;
-  footerMatchIdx = 0;
-  payloadLen = 0;
-  payloadIdx = 0;
-  lenBytes[0] = 0;
-  lenBytes[1] = 0;
-}
+void sendEnableEngineeringModeOnce(unsigned long timeoutMs = 1000);
+void sendRestartModuleOnce(unsigned long timeoutMs = 1000);
 
-// sliding-window add
+// -------------------------------------------------------------
+// Utility: sliding window
+// -------------------------------------------------------------
 void addMetric(unsigned long v) {
   if (personWindowFrames < 1) personWindowFrames = 1;
   if (personWindowFrames > MAX_WINDOW) personWindowFrames = MAX_WINDOW;
@@ -121,7 +153,6 @@ void addMetric(unsigned long v) {
     metricsIdx = (metricsIdx + 1) % personWindowFrames;
     metricsCount++;
   } else {
-    // replace oldest
     int replace = metricsIdx % personWindowFrames;
     metricsSum -= metricsBuf[replace];
     metricsBuf[replace] = v;
@@ -135,206 +166,6 @@ unsigned long metricsAverage() {
   return metricsSum / metricsCount;
 }
 
-// Compute metrics
-unsigned long compute_interframe_diff(uint8_t *buf, uint16_t len) {
-  if (lastPayloadLen == 0 || len == 0) return 0;
-  uint64_t sum = 0;
-  uint16_t n = (len < lastPayloadLen) ? len : lastPayloadLen;
-  for (uint16_t i = 0; i < n; ++i) sum += abs((int)buf[i] - (int)lastPayloadBuf[i]);
-  if (len > lastPayloadLen) {
-    for (uint16_t i = lastPayloadLen; i < len; ++i) sum += abs((int)buf[i]);
-    n = len;
-  } else if (lastPayloadLen > len) {
-    for (uint16_t i = len; i < lastPayloadLen; ++i) sum += abs((int)lastPayloadBuf[i]);
-    n = lastPayloadLen;
-  }
-  if (n == 0) return 0;
-  return (unsigned long)(sum / n); // average difference per byte
-}
-
-unsigned long compute_payload_sum(uint8_t *buf, uint16_t len) {
-  uint64_t s = 0;
-  for (uint16_t i = 0; i < len; ++i) s += buf[i];
-  return (unsigned long)s;
-}
-
-unsigned long compute_nonzero_count(uint8_t *buf, uint16_t len) {
-  unsigned int c = 0;
-  for (uint16_t i = 0; i < len; ++i) if (buf[i] != 0) c++;
-  return c;
-}
-
-// ---------------- Frame processing ----------------
-void processFrame(uint8_t *buf, uint16_t len) {
-  // early guard
-  if (len == 0) {
-    lastFrameMetric = 0;
-    addMetric(0);
-    return;
-  }
-
-  validFrames++;
-
-  // Auto-detect engineering mode if not already detected
-  if (!engineeringDetected) {
-    int nonzero = 0;
-    for (uint16_t i = 0; i < len; ++i) if (buf[i] != 0) nonzero++;
-    if ((uint16_t)len >= ENGINEERING_LEN_THRESH || nonzero > (len / 4)) {
-      engineeringDetected = true;
-      metricMode = PAYLOAD_SUM; // switch to absolute energy metric automatically
-      Serial.printf("[AUTO] Engineering-mode detected (len=%u nonzero=%d). Switching to PAYLOAD_SUM\n", (unsigned)len, nonzero);
-      // reset metrics so prior small-frame data doesn't pollute windows
-      metricsIdx = 0; metricsCount = 0; metricsSum = 0;
-      lastPayloadLen = 0; // reset interframe baseline
-    }
-  }
-
-  unsigned long metric = 0;
-
-  if (engineeringDetected) {
-    // treat payload as gate energy array (1 byte per gate)
-    int gs = (gateEnd < 0) ? (int)len - 1 : gateEnd;
-    if (gs >= (int)len) gs = (int)len - 1;
-    int s = gateStart;
-    if (s < 0) s = 0;
-    if (s > gs) { s = 0; gs = (int)len - 1; }
-
-    unsigned long gateSum = 0;
-    unsigned int countAbove = 0;
-    unsigned int gateMax = 0;
-    for (int i = s; i <= gs; ++i) {
-      unsigned int v = buf[i];
-      gateSum += v;
-      if (v > (unsigned)perGateThreshold) countAbove++;
-      if (v > gateMax) gateMax = v;
-    }
-
-    // choose metric (PAYLOAD_SUM default in engineering mode)
-    if (metricMode == PAYLOAD_SUM) metric = gateSum;
-    else if (metricMode == NONZERO_COUNT) metric = compute_nonzero_count(buf, len);
-    else metric = compute_interframe_diff(buf, len); // fallback if user explicitly set it
-
-    lastFrameMetric = metric;
-    addMetric(metric);
-    unsigned long avg = metricsAverage();
-
-    // detection rules: either avg > baseline * factor (if baseline available), or avg >= personThreshold
-    if (hasBaseline && autoBaselineEnabled) {
-      personDetected = (avg > (unsigned long)(baselineValue * baselineFactor));
-    } else {
-      personDetected = (avg >= personThreshold);
-    }
-
-    Serial.printf("[ENG] len=%u gates=%d..%d sum=%lu max=%u above=%u avg(%d)=%lu -> detected=%s\n",
-                  (unsigned)len, s, gs, gateSum, gateMax, countAbove, personWindowFrames, avg, personDetected ? "YES" : "no");
-
-  } else {
-    // Non-engineering: try to detect target-list style frames (small, structured)
-    // Heuristic: if first byte is small <= 10, treat as target count.
-    if (len >= 1 && buf[0] > 0 && buf[0] < 20) {
-      uint8_t maybeCount = buf[0];
-      personDetected = (maybeCount > 0);
-      metric = maybeCount;
-      lastFrameMetric = metric;
-      addMetric(metric);
-      Serial.printf("[TL] target_count=%u -> detected=%s\n", maybeCount, personDetected ? "YES" : "no");
-    } else {
-      // fallback: compute chosen metric (default interframe diff)
-      if (metricMode == INTERFRAME_DIFF) metric = compute_interframe_diff(buf, len);
-      else if (metricMode == PAYLOAD_SUM) metric = compute_payload_sum(buf, len);
-      else metric = compute_nonzero_count(buf, len);
-
-      lastFrameMetric = metric;
-      addMetric(metric);
-      unsigned long avg = metricsAverage();
-      if (hasBaseline && autoBaselineEnabled) {
-        personDetected = (avg > (unsigned long)(baselineValue * baselineFactor));
-      } else {
-        personDetected = (avg >= personThreshold);
-      }
-      Serial.printf("[FALLBACK] len=%u metric=%lu avg(%d)=%lu -> detected=%s\n",
-                    (unsigned)len, metric, personWindowFrames, avg, personDetected ? "YES" : "no");
-    }
-  }
-
-  // Store current payload as last payload for inter-frame diff calculations
-  if (len <= MAX_PAYLOAD) {
-    memcpy(lastPayloadBuf, buf, len);
-    lastPayloadLen = len;
-  } else {
-    lastPayloadLen = 0;
-  }
-}
-
-// feed bytes to parser (streaming)
-void feedByteToParser(uint8_t b) {
-  switch (parseState) {
-    case SEARCH_HEADER:
-      if (b == FRAME_HEADER[headerMatchIdx]) {
-        headerMatchIdx++;
-        if (headerMatchIdx == 4) {
-          parseState = READ_LEN;
-          headerMatchIdx = 0;
-          lenBytes[0] = 0; lenBytes[1] = 0;
-        }
-      } else {
-        headerMatchIdx = (b == FRAME_HEADER[0]) ? 1 : 0;
-      }
-      break;
-
-    case READ_LEN:
-      if (lenBytes[0] == 0 && lenBytes[1] == 0) {
-        lenBytes[0] = b;
-      } else {
-        lenBytes[1] = b;
-        payloadLen = (uint16_t)lenBytes[0] | ((uint16_t)lenBytes[1] << 8);
-        lenBytes[0] = 0; lenBytes[1] = 0;
-        if (payloadLen == 0) {
-          payloadIdx = 0;
-          parseState = READ_FOOTER;
-          footerMatchIdx = 0;
-        } else if (payloadLen <= MAX_PAYLOAD) {
-          if (payloadLen > MAX_PAYLOAD) {
-            Serial.printf("[PARSER] payloadLen > MAX_PAYLOAD (%u) - resync\n", (unsigned)payloadLen);
-            resetParser();
-          } else {
-            payloadIdx = 0;
-            parseState = READ_PAYLOAD;
-          }
-        } else {
-          Serial.printf("[PARSER] Invalid payloadLen=%u, resync\n", (unsigned)payloadLen);
-          resetParser();
-        }
-      }
-      break;
-
-    case READ_PAYLOAD:
-      payloadBuf[payloadIdx++] = b;
-      if (payloadIdx >= payloadLen) {
-        parseState = READ_FOOTER;
-        footerMatchIdx = 0;
-      }
-      break;
-
-    case READ_FOOTER:
-      if (b == FRAME_FOOTER[footerMatchIdx]) {
-        footerMatchIdx++;
-        if (footerMatchIdx == 4) {
-          // valid frame complete
-          processFrame(payloadBuf, payloadLen);
-          resetParser();
-        }
-      } else {
-        // mismatch -> resync conservatively
-        Serial.println("[PARSER] Footer mismatch, resyncing");
-        resetParser();
-        if (b == FRAME_HEADER[0]) headerMatchIdx = 1;
-      }
-      break;
-  }
-}
-
-// ---------------- Helpers for calibration and UI ----------------
 void resetMetricsBuffer(const char *msg) {
   metricsIdx = 0;
   metricsCount = 0;
@@ -346,51 +177,267 @@ void resetMetricsBuffer(const char *msg) {
   statusMessage = msg;
 }
 
-// Run a small calibration capture (N frames) to compute baseline.
-// This is a blocking routine: it waits for captureFrames parsed frames.
-void runCalibration(int captureFrames = 8) {
-  if (captureFrames < 1) captureFrames = 1;
-  Serial.printf("[CAL] Capturing %d frames for baseline... (stand away)\n", captureFrames);
+// -------------------------------------------------------------
+// Metric calculators
+// -------------------------------------------------------------
 
-  // Clear metrics buffer to start collecting
-  metricsIdx = 0; metricsCount = 0; metricsSum = 0;
-  unsigned long start = millis();
-  unsigned int captured = 0;
-  unsigned long timeoutMs = 6000 + (unsigned long)captureFrames * 500;
+bool parseLd2410DataPayload(const uint8_t* p, size_t len, ParsedLd2410Report& out) {
+  out = ParsedLd2410Report();
 
-  // We'll poll metricsCount to see when frames are appended to the window
-  while (captured < (unsigned)captureFrames && (millis() - start) < timeoutMs) {
-    // If metricsCount increases, assume a frame was processed
-    if (metricsCount > captured) {
-      // set captured to metricsCount but clamp to captureFrames
-      captured = metricsCount;
-    }
-    // Allow other background tasks (not strictly necessary)
-    delay(20);
+  // Must contain at least: type + 0xAA + base fields up to detection distance
+  // Offsets as used by MyLD2410:
+  // [0]=type, [1]=0xAA, [2]=status, [3..4]=mDist, [5]=mSig, [6..7]=sDist, [8]=sSig, [9..10]=distance
+  if (!p || len < 11) return false;
+  if (!((p[0] == 0x01) || (p[0] == 0x02))) return false;
+  if (p[1] != 0xAA) return false;
+
+  out.type = p[0];
+  out.enhanced = (p[0] == 0x01);
+
+  out.targetState = p[2] & 0x07; // 0..3 relevant for presence
+  out.movingDistanceCm = (uint16_t)p[3] | ((uint16_t)p[4] << 8);
+  out.movingEnergy = p[5];
+  out.stationaryDistanceCm = (uint16_t)p[6] | ((uint16_t)p[7] << 8);
+  out.stationaryEnergy = p[8];
+  out.detectionDistanceCm = (uint16_t)p[9] | ((uint16_t)p[10] << 8);
+
+  if (!out.enhanced) {
+    out.ok = true;
+    return true;
   }
 
-  if (metricsCount > 0) {
-    baselineValue = metricsAverage();
-    hasBaseline = true;
-    Serial.printf("[CAL] Done: baseline=%lu (factor %.2f)\n", baselineValue, baselineFactor);
-    statusMessage = "Calibration done";
-  } else {
-    Serial.println("[CAL] Failed: no frames captured");
-    statusMessage = "Calibration failed";
-  }
+  // Enhanced extension
+  // [11]=moving N, [12]=stationary N, then moving (N+1) bytes, then stationary (N+1) bytes, then light/out optional
+  if (len < 13) return false;
 
-  // reset metric window after calibration, to allow fresh smoothing
-  metricsIdx = 0; metricsCount = 0; metricsSum = 0;
+  uint8_t mN = p[11];
+  uint8_t sN = p[12];
+  if (mN > 8) mN = 8;
+  if (sN > 8) sN = 8;
+  out.movingGateMax = mN;
+  out.stationaryGateMax = sN;
+
+  size_t idx = 13;
+  if (idx + (size_t)mN + 1 > len) return false;
+  for (uint8_t i = 0; i <= mN; i++) out.movingGateEnergy[i] = p[idx++];
+
+  if (idx + (size_t)sN + 1 > len) return false;
+  for (uint8_t i = 0; i <= sN; i++) out.stationaryGateEnergy[i] = p[idx++];
+
+  // Optional extras if present
+  if (idx < len) out.lightLevel = p[idx++];
+  if (idx < len) out.outLevel = p[idx++];
+
+  out.ok = true;
+  return true;
 }
 
-// send enable engineering mode and wait for ACK (blocking up to timeoutMs)
-void sendEnableEngineeringModeOnce(unsigned long timeoutMs = 800) {
-  // Send command: header + len(0x0002) + cmdWord(0x0062 LSB-first) + footer
+unsigned long compute_interframe_diff(uint8_t *buf, uint16_t len) {
+  if (lastPayloadLen == 0 || len == 0) return 0;
+  uint64_t sum = 0;
+  uint16_t n = (len < lastPayloadLen) ? len : lastPayloadLen;
+  for (uint16_t i = 0; i < n; ++i) sum += abs((int)buf[i] - (int)lastPayloadBuf[i]);
+
+  if (len > lastPayloadLen) {
+    for (uint16_t i = lastPayloadLen; i < len; ++i) sum += abs((int)buf[i]);
+    n = len;
+  } else if (lastPayloadLen > len) {
+    for (uint16_t i = len; i < lastPayloadLen; ++i) sum += abs((int)lastPayloadBuf[i]);
+    n = lastPayloadLen;
+  }
+
+  if (n == 0) return 0;
+  return (unsigned long)(sum / n);
+}
+
+unsigned long compute_payload_sum(uint8_t *buf, uint16_t len) {
+  uint64_t s = 0;
+  for (uint16_t i = 0; i < len; ++i) s += buf[i];
+  return (unsigned long)s;
+}
+
+unsigned long compute_nonzero_count(uint8_t *buf, uint16_t len) {
+  unsigned long c = 0;
+  for (uint16_t i = 0; i < len; ++i) if (buf[i] != 0) c++;
+  return c;
+}
+
+// -------------------------------------------------------------
+// Command parser (FD FC FB FA ... 04 03 02 01)
+// -------------------------------------------------------------
+void resetCmdParser() {
+  cmdParseState = CMD_SEARCH_HEADER;
+  cmdHeaderMatchIdx = 0;
+  cmdFooterMatchIdx = 0;
+  cmdPayloadLen = 0;
+  cmdPayloadIdx = 0;
+  cmdLenBytes[0] = 0;
+  cmdLenBytes[1] = 0;
+}
+
+void feedByteToCmdParser(uint8_t b) {
+  switch (cmdParseState) {
+    case CMD_SEARCH_HEADER:
+      if (b == CMD_HEADER[cmdHeaderMatchIdx]) {
+        cmdHeaderMatchIdx++;
+        if (cmdHeaderMatchIdx == 4) {
+          cmdParseState = CMD_READ_LEN;
+          cmdHeaderMatchIdx = 0;
+          cmdLenBytes[0] = 0;
+          cmdLenBytes[1] = 0;
+        }
+      } else {
+        cmdHeaderMatchIdx = (b == CMD_HEADER[0]) ? 1 : 0;
+      }
+      break;
+
+    case CMD_READ_LEN:
+      if (cmdLenBytes[0] == 0 && cmdLenBytes[1] == 0) {
+        cmdLenBytes[0] = b;
+      } else {
+        cmdLenBytes[1] = b;
+        cmdPayloadLen = (uint16_t)cmdLenBytes[0] | ((uint16_t)cmdLenBytes[1] << 8);
+        cmdLenBytes[0] = 0;
+        cmdLenBytes[1] = 0;
+
+        if (cmdPayloadLen == 0) {
+          cmdPayloadIdx = 0;
+          cmdParseState = CMD_READ_FOOTER;
+          cmdFooterMatchIdx = 0;
+        } else if (cmdPayloadLen <= MAX_PAYLOAD) {
+          cmdPayloadIdx = 0;
+          cmdParseState = CMD_READ_PAYLOAD;
+        } else {
+          Serial.printf("[CMD-PARSER] Invalid payloadLen=%u, resync\n", (unsigned)cmdPayloadLen);
+          resetCmdParser();
+        }
+      }
+      break;
+
+    case CMD_READ_PAYLOAD:
+      cmdPayloadBuf[cmdPayloadIdx++] = b;
+      if (cmdPayloadIdx >= cmdPayloadLen) {
+        cmdParseState = CMD_READ_FOOTER;
+        cmdFooterMatchIdx = 0;
+      }
+      break;
+
+    case CMD_READ_FOOTER:
+      if (b == CMD_FOOTER[cmdFooterMatchIdx]) {
+        cmdFooterMatchIdx++;
+        if (cmdFooterMatchIdx == 4) {
+          // Full command frame decoded; mostly ACK/debug visibility
+          Serial.printf("\n[CMD-FRAME] payloadLen=%u payload:", (unsigned)cmdPayloadLen);
+          for (uint16_t i = 0; i < cmdPayloadLen; ++i) {
+            Serial.printf(" %02X", cmdPayloadBuf[i]);
+          }
+          Serial.println();
+          resetCmdParser();
+        }
+      } else {
+        Serial.println("[CMD-PARSER] Footer mismatch, resync");
+        resetCmdParser();
+        if (b == CMD_HEADER[0]) cmdHeaderMatchIdx = 1;
+      }
+      break;
+  }
+}
+
+// -------------------------------------------------------------
+// Report parser (0xAA ... 0x55)
+// -------------------------------------------------------------
+void reportFeedByte(uint8_t b) {
+  switch (rParseState) {
+    case R_SEARCH_HEAD:
+      if (b == REPORT_HEAD) {
+        rParseState = R_IN_FRAME;
+        reportIdx = 0;
+      }
+      break;
+
+    case R_IN_FRAME:
+      if (b == REPORT_TAIL) {
+        // complete report payload in reportBuf[0..reportIdx-1]
+        if (reportIdx > 0) {
+          processReportFrame(reportBuf, (uint16_t)reportIdx);
+        }
+        rParseState = R_SEARCH_HEAD;
+        reportIdx = 0;
+      } else {
+        if (reportIdx < REPORT_MAX) {
+          reportBuf[reportIdx++] = b;
+        } else {
+          Serial.println("[REPORT-PARSER] Buffer overflow, resync");
+          rParseState = R_SEARCH_HEAD;
+          reportIdx = 0;
+        }
+      }
+      break;
+  }
+}
+
+// -------------------------------------------------------------
+// Process report payload (target/gate data)
+// -------------------------------------------------------------
+void processReportFrame(uint8_t *buf, uint16_t len) {
+  validFrames++;
+
+  ParsedLd2410Report r;
+  if (parseLd2410DataPayload(buf, len, r)) {
+    // Authoritative detection from status (Table 12)
+    personDetected = (r.targetState >= 1 && r.targetState <= 3);
+
+    // Keep metric buffer for smoothing/telemetry
+    unsigned long metric = 0;
+    if (r.enhanced && metricMode == PAYLOAD_SUM) {
+      // sum moving + stationary gate energies
+      for (uint8_t i = 0; i <= r.movingGateMax; i++) metric += r.movingGateEnergy[i];
+      for (uint8_t i = 0; i <= r.stationaryGateMax; i++) metric += r.stationaryGateEnergy[i];
+    } else if (metricMode == NONZERO_COUNT) {
+      metric = (r.movingEnergy > 0) + (r.stationaryEnergy > 0);
+    } else {
+      // default: use combined basic energies
+      metric = (unsigned long)r.movingEnergy + (unsigned long)r.stationaryEnergy;
+    }
+
+    lastFrameMetric = metric;
+    addMetric(metric);
+    unsigned long avg = metricsAverage();
+
+    // Optional override with baseline mode:
+    if (hasBaseline && autoBaselineEnabled) {
+      personDetected = personDetected || (avg > (unsigned long)(baselineValue * baselineFactor));
+    } else {
+      personDetected = personDetected || (avg >= personThreshold);
+    }
+
+    engineeringDetected = r.enhanced;
+
+    Serial.printf("\n[PARSED] type=%02X state=%u mDist=%u mE=%u sDist=%u sE=%u d=%u eng=%s metric=%lu avg=%lu detected=%s\n",
+                  r.type, r.targetState, r.movingDistanceCm, r.movingEnergy,
+                  r.stationaryDistanceCm, r.stationaryEnergy, r.detectionDistanceCm,
+                  r.enhanced ? "YES" : "no", metric, avg, personDetected ? "YES" : "no");
+    return;
+  }
+
+  // fallback if parser fails (keep old logic)
+  Serial.printf("\n[PARSE-FAIL] len=%u (fallback path)\n", (unsigned)len);
+  unsigned long metric = compute_payload_sum(buf, len);
+  lastFrameMetric = metric;
+  addMetric(metric);
+  unsigned long avg = metricsAverage();
+  personDetected = (avg >= personThreshold);
+}
+
+// -------------------------------------------------------------
+// Commands
+// -------------------------------------------------------------
+void sendEnableEngineeringModeOnce(unsigned long timeoutMs) {
+  // Send: FD FC FB FA 02 00 62 00 04 03 02 01
   uint8_t cmd[] = { 0xFD,0xFC,0xFB,0xFA, 0x02,0x00, 0x62,0x00, 0x04,0x03,0x02,0x01 };
   ld2410.write(cmd, sizeof(cmd));
-  Serial.println("[CMD] Sent enable-engineering-mode; waiting for ACK...");
+  Serial.println("[CMD] Sent enable-engineering command; waiting for ACK...");
 
-  // ACK pattern prefix
   const uint8_t ACK_PREFIX[] = {0xFD,0xFC,0xFB,0xFA, 0x04,0x00, 0x62,0x01};
   int match = 0;
   unsigned long start = millis();
@@ -398,11 +445,9 @@ void sendEnableEngineeringModeOnce(unsigned long timeoutMs = 800) {
   while (millis() - start < timeoutMs) {
     if (ld2410.available()) {
       uint8_t b = ld2410.read();
-      // Serial.printf("%02X ", b); // optional raw echo
       if (b == ACK_PREFIX[match]) {
         match++;
         if (match == (int)sizeof(ACK_PREFIX)) {
-          // next two bytes are status
           unsigned long t0 = millis();
           while (ld2410.available() < 2 && millis() - t0 < 200) delay(5);
           if (ld2410.available() >= 2) {
@@ -410,17 +455,16 @@ void sendEnableEngineeringModeOnce(unsigned long timeoutMs = 800) {
             uint8_t s1 = ld2410.read();
             uint16_t status = (uint16_t)s0 | ((uint16_t)s1 << 8);
             if (status == 0) {
-              Serial.println("[ACK] Engineering mode enabled (status=0).");
+              Serial.println("[ACK] Engineering mode enabled.");
               engineeringDetected = true;
               metricMode = PAYLOAD_SUM;
               metricsIdx = 0; metricsCount = 0; metricsSum = 0;
-              return;
             } else {
-              Serial.printf("[ACK] NACK status=%u\n", (unsigned)status);
-              return;
+              Serial.printf("[ACK] Enable engineering failed, status=%u\n", (unsigned)status);
             }
+            return;
           } else {
-            Serial.println("[ACK] Prefix matched but status bytes missing.");
+            Serial.println("[ACK] Prefix matched but status bytes missing");
             return;
           }
         }
@@ -431,13 +475,137 @@ void sendEnableEngineeringModeOnce(unsigned long timeoutMs = 800) {
       delay(5);
     }
   }
-  Serial.println("[CMD] No ACK received (timeout).");
+  Serial.println("[CMD] No ACK for enable-engineering (timeout).");
 }
 
-// ---------------- Setup & UI ----------------
+void sendRestartModuleOnce(unsigned long timeoutMs) {
+  // Per your pasted page 16-17:
+  // Send: FD FC FB FA 02 00 A3 00 04 03 02 01
+  uint8_t cmd[] = { 0xFD,0xFC,0xFB,0xFA, 0x02,0x00, 0xA3,0x00, 0x04,0x03,0x02,0x01 };
+  ld2410.write(cmd, sizeof(cmd));
+  Serial.println("[CMD] Sent restart command; waiting for ACK...");
+
+  const uint8_t ACK_PREFIX[] = {0xFD,0xFC,0xFB,0xFA, 0x04,0x00, 0xA3,0x01};
+  int match = 0;
+  unsigned long start = millis();
+
+  while (millis() - start < timeoutMs) {
+    if (ld2410.available()) {
+      uint8_t b = ld2410.read();
+      if (b == ACK_PREFIX[match]) {
+        match++;
+        if (match == (int)sizeof(ACK_PREFIX)) {
+          unsigned long t0 = millis();
+          while (ld2410.available() < 2 && millis() - t0 < 200) delay(5);
+          if (ld2410.available() >= 2) {
+            uint8_t s0 = ld2410.read();
+            uint8_t s1 = ld2410.read();
+            uint16_t status = (uint16_t)s0 | ((uint16_t)s1 << 8);
+            Serial.printf("[ACK] Restart status=%u\n", (unsigned)status);
+            return;
+          } else {
+            Serial.println("[ACK] Restart prefix matched but status missing");
+            return;
+          }
+        }
+      } else {
+        match = (b == ACK_PREFIX[0]) ? 1 : 0;
+      }
+    } else {
+      delay(5);
+    }
+  }
+  Serial.println("[CMD] No ACK for restart (timeout).");
+}
+
+// -------------------------------------------------------------
+// Calibration
+// -------------------------------------------------------------
+void runCalibration(int captureFrames) {
+  if (captureFrames < 1) captureFrames = 1;
+  Serial.printf("[CAL] Capturing %d frames for baseline (stand away)...\n", captureFrames);
+
+  metricsIdx = 0;
+  metricsCount = 0;
+  metricsSum = 0;
+
+  unsigned long start = millis();
+  unsigned long timeoutMs = 6000 + (unsigned long)captureFrames * 500;
+
+  // Wait until enough report frames contributed metrics
+  while ((metricsCount < captureFrames) && (millis() - start < timeoutMs)) {
+    // let loop continue reading serial
+    delay(20);
+  }
+
+  if (metricsCount > 0) {
+    baselineValue = metricsAverage();
+    hasBaseline = true;
+    Serial.printf("[CAL] Done: baseline=%lu factor=%.2f\n", baselineValue, baselineFactor);
+    statusMessage = "Calibration done";
+  } else {
+    Serial.println("[CAL] Failed: no frames captured");
+    statusMessage = "Calibration failed";
+  }
+
+  // clear smoothing buffer after calibration
+  metricsIdx = 0;
+  metricsCount = 0;
+  metricsSum = 0;
+}
+
+// -------------------------------------------------------------
+// UI
+// -------------------------------------------------------------
+void drawInterface() {
+  canvas.fillSprite(BLACK);
+
+  canvas.setCursor(5, 5);
+  canvas.setTextSize(1);
+  canvas.setTextColor(WHITE);
+  canvas.println("LD2410C Interactive Scanner");
+  canvas.drawFastHLine(0, 18, canvas.width() - 10, WHITE);
+
+  canvas.setCursor(5, 24);
+  canvas.setTextColor(WHITE);
+  canvas.setTextSize(1);
+  canvas.printf("W/Q Th+/-  A/S Win+/-  C Mode  E EngOn  R Restart  Space Cal");
+
+  const char* modeName = (metricMode == INTERFRAME_DIFF) ? "INTER_DIFF" :
+                         (metricMode == PAYLOAD_SUM) ? "PAYLOAD_SUM" : "NONZERO";
+
+  canvas.setCursor(5, 38);
+  canvas.setTextColor(YELLOW);
+  canvas.printf("Mode:%s  Win:%d  Th:%lu", modeName, personWindowFrames, personThreshold);
+
+  canvas.setCursor(5, 52);
+  canvas.setTextColor(WHITE);
+  canvas.printf("Eng:%s Baseline:%lu Last:%lu", engineeringDetected ? "YES" : "no", baselineValue, lastFrameMetric);
+
+  canvas.setTextSize(2);
+  canvas.setCursor(5, 84);
+  if (personDetected) {
+    canvas.setTextColor(RED);
+    canvas.printf("Person: YES");
+  } else {
+    canvas.setTextColor(GREEN);
+    canvas.printf("Person: NO ");
+  }
+
+  canvas.setTextSize(1);
+  canvas.setTextColor(WHITE);
+  canvas.setCursor(5, canvas.height() - 14);
+  canvas.printf("Status: %s", statusMessage.c_str());
+
+  canvas.pushSprite(2, 2);
+}
+
+// -------------------------------------------------------------
+// Setup / Loop
+// -------------------------------------------------------------
 void setup() {
   Serial.begin(LOG_BAUD);
-  Serial.println("\n=== CARDPUTER + LD2410C - FRAME PARSER (Full) ===");
+  Serial.println("\n=== CARDPUTER + LD2410C - CMD+REPORT PARSER ===");
 
   auto cfg = M5.config();
   M5Cardputer.begin(cfg, true);
@@ -446,93 +614,48 @@ void setup() {
   uint16_t w = M5Cardputer.Display.width();
   uint16_t h = M5Cardputer.Display.height();
   canvas.createSprite(w - 4, h - 4);
-  canvas.setTextColor(WHITE);
-  canvas.setTextSize(1);
 
-  Serial.printf("[UART] Initializing at %d baud\n", SENSOR_BAUD);
+  Serial.printf("[UART] Sensor UART init @ %d\n", SENSOR_BAUD);
   ld2410.begin(SENSOR_BAUD, SERIAL_8N1, SENSOR_RX_PIN, SENSOR_TX_PIN);
-  delay(200);
 
-  resetParser();
+  resetCmdParser();
   resetMetricsBuffer("Ready");
+  statusMessage = "Ready";
 
-  Serial.println("[INIT] Controls: W/Q thr +/- | A/S win +/- | C cycle metric | E send enable | Space calibrate | Esc restart");
+  Serial.println("[INIT] Controls: W/Q Th+/- | A/S Win+/- | C Mode | E Enable Eng | R Restart | Space Cal | Esc Reboot");
 }
 
-void drawInterface() {
-  canvas.fillSprite(BLACK);
-
-  canvas.setCursor(5,5);
-  canvas.setTextSize(1);
-  canvas.setTextColor(WHITE);
-  canvas.println("LD2410C Interactive Scanner");
-  canvas.drawFastHLine(0,18,canvas.width()-10,WHITE);
-
-  canvas.setCursor(5,24);
-  canvas.setTextSize(1);
-  canvas.setTextColor(WHITE);
-  canvas.printf("W/Q: Thresh +/-   A/S: Win +/-   C: Mode   E: Enable ENG   Space: Calib");
-
-  canvas.setTextSize(1);
-  canvas.setTextColor(YELLOW);
-  canvas.setCursor(5,38);
-  const char *modeName = (metricMode==INTERFRAME_DIFF) ? "INTER_DIFF" : (metricMode==PAYLOAD_SUM) ? "PAYLOAD_SUM" : "NONZERO";
-  canvas.printf("Mode: %s   Window: %d   Thresh: %lu", modeName, personWindowFrames, personThreshold);
-
-  canvas.setTextSize(1);
-  canvas.setTextColor(WHITE);
-  canvas.setCursor(5,52);
-  canvas.printf("Baseline: %lu  EngMode:%s", baselineValue, engineeringDetected ? "YES" : "no");
-
-  canvas.setTextSize(2);
-  if (personDetected) {
-    canvas.setTextColor(RED);
-    canvas.setCursor(5,84);
-    canvas.printf("Person: YES");
-  } else {
-    canvas.setTextColor(GREEN);
-    canvas.setCursor(5,84);
-    canvas.printf("Person: NO ");
-  }
-
-  canvas.setTextSize(1);
-  canvas.setTextColor(WHITE);
-  canvas.setCursor(5, canvas.height()-14);
-  canvas.printf("Status: %s", statusMessage.c_str());
-
-  canvas.pushSprite(2,2);
-}
-
-// ---------------- Main loop ----------------
 void loop() {
   M5Cardputer.update();
 
-  // feed incoming bytes to parser
   while (ld2410.available()) {
     uint8_t b = (uint8_t)ld2410.read();
     byteCount++;
     anyDataReceived = true;
     dataTimestamp = millis();
 
-    // optional hex debug print (comment out if too verbose)
+    // Optional raw hex stream debug
     if (b < 16) Serial.print("0");
     Serial.print(b, HEX);
     Serial.print(" ");
     if (byteCount % 32 == 0) Serial.println();
 
-    feedByteToParser(b);
+    // Feed both parsers
+    feedByteToCmdParser(b);  // for command/ACK frames
+    reportFeedByte(b);       // for report data frames (0xAA ... 0x55)
   }
 
   if (anyDataReceived && millis() - dataTimestamp > 2000) {
     statusMessage = "No recent data...";
   }
 
-  // keyboard controls
+  // Keyboard controls
   if (M5Cardputer.Keyboard.isChange()) {
     if (M5Cardputer.Keyboard.isPressed()) {
       Keyboard_Class::KeysState ks = M5Cardputer.Keyboard.keysState();
       for (auto k : ks.word) {
         lastCapturedKey = k;
+
         if (millis() - lastKeyTime > KEY_DELAY_MS) {
           if (k == 'w' || k == 'W') {
             personThreshold++;
@@ -541,26 +664,29 @@ void loop() {
             if (personThreshold > 0) personThreshold--;
             statusMessage = "Threshold --";
           } else if (k == 'a' || k == 'A') {
-            if (personWindowFrames > 1) personWindowFrames = max(1, personWindowFrames/2);
+            if (personWindowFrames > 1) personWindowFrames = max(1, personWindowFrames / 2);
             metricsIdx = 0; metricsCount = 0; metricsSum = 0;
             statusMessage = "Window decreased";
           } else if (k == 's' || k == 'S') {
-            if (personWindowFrames < MAX_WINDOW) personWindowFrames = min(MAX_WINDOW, personWindowFrames*2);
+            if (personWindowFrames < MAX_WINDOW) personWindowFrames = min(MAX_WINDOW, personWindowFrames * 2);
             metricsIdx = 0; metricsCount = 0; metricsSum = 0;
             statusMessage = "Window increased";
           } else if (k == 'c' || k == 'C') {
             metricMode = MetricMode((metricMode + 1) % 3);
-            statusMessage = "Metric mode changed";
             metricsIdx = 0; metricsCount = 0; metricsSum = 0;
+            statusMessage = "Metric mode changed";
           } else if (k == 'e' || k == 'E') {
             sendEnableEngineeringModeOnce(1000);
-            statusMessage = "Enable command sent";
+            statusMessage = "Enable engineering sent";
+          } else if (k == 'r' || k == 'R') {
+            sendRestartModuleOnce(1000);
+            statusMessage = "Restart command sent";
           } else if (k == ' ') {
             runCalibration(8);
-            statusMessage = "Calibration done";
           } else if (k == '\x1B') {
             esp_restart();
           }
+
           lastKeyTime = millis();
         }
       }
